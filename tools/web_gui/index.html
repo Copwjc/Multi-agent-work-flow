@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Multi-Agent 协作工作台</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <!-- ═══════════ 顶部导航栏 ═══════════ -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="brand-icon">⬡</div>
+        <div class="brand-text">
+          <h1>Multi-Agent 工作台</h1>
+          <p class="eyebrow">多智能体协作管理与可视化</p>
+        </div>
+      </div>
+
+      <div class="topbar-center">
+        <label class="field-label" for="taskSelect">当前任务</label>
+        <select id="taskSelect"></select>
+        <button id="refreshButton" class="btn-ghost" title="刷新">↻</button>
+        <button id="createTaskBtn" class="btn-accent" title="新建任务">＋ 新建</button>
+      </div>
+
+	      <div class="topbar-right">
+	        <div class="timestamp" id="timestampText">--:--:--</div>
+	        <div class="live-control">
+	          <span id="liveDot" class="live-dot"></span>
+	          <span id="liveStatus">连接中</span>
+	          <button id="liveToggle" class="btn-ghost-sm">暂停</button>
+        </div>
+        <button id="themeToggle" class="btn-ghost" title="切换主题">◐</button>
+      </div>
+      <div id="globalAgentStatus" class="global-agent-status"></div>
+	    </header>
+
+	    <!-- ═══════════ 用户总控命令栏 ═══════════ -->
+	    <section class="command-bar">
+		      <div class="command-main">
+		        <label class="field-label" for="groupCommandInput">用户对工作组下发命令</label>
+		        <input id="groupCommandInput" placeholder="输入新的目标、纠偏或继续推进要求；将由 Leader 拆解并重新安排各 Agent" />
+		      </div>
+		      <button id="groupCommandButton" class="btn-primary">发送给 Leader</button>
+		      <label class="auto-play-inline" title="自动处理 open request">
+		        <input type="checkbox" id="autoPlayToggle" checked />
+		        <span>自动接力</span>
+		      </label>
+		      <span id="groupCommandStatus" class="send-status"></span>
+		    </section>
+
+	    <!-- ═══════════ 统计卡片 ═══════════ -->
+    <div class="stats-bar">
+      <div class="stat-card">
+        <span class="stat-value" id="agentCount">0</span>
+        <span class="stat-label">智能体</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-value" id="requestCount">0</span>
+        <span class="stat-label">请求总数</span>
+      </div>
+      <div class="stat-card stat-warn stat-clickable" id="pendingStatCard" role="button" tabindex="0" title="查看待处理项目">
+        <span class="stat-value" id="openCount">0</span>
+        <span class="stat-label">待处理</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-value" id="resourceCount">0</span>
+        <span class="stat-label">共享资源</span>
+      </div>
+    </div>
+
+    <!-- ═══════════ 主体内容 ═══════════ -->
+    <div class="main-grid">
+
+      <!-- ── 左栏：任务概览 + Agent 拓扑 ── -->
+      <section class="col-left">
+        <div class="card active-agent-card">
+          <div class="card-header">
+            <h3>活跃 Agent 输出</h3>
+            <span class="status-badge badge-muted" id="activeAgentBadge">空闲</span>
+          </div>
+          <div id="activeAgentMeta" class="active-agent-meta">暂无活跃 Agent</div>
+          <pre id="activeAgentOutput" class="active-agent-output">没有运行中的 agent。</pre>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3>📋 任务概要</h3>
+            <span class="badge-muted" id="taskTitle">加载中...</span>
+          </div>
+          <pre id="briefText" class="code-block">暂无任务概要</pre>
+        </div>
+      </section>
+
+      <!-- ── 中栏：拓扑 + 对话请求 + 资源 + 活动日志 ── -->
+      <section class="col-center">
+        <div class="card" style="margin-bottom: 16px;">
+          <div class="card-header">
+            <h3>🔗 Agent 拓扑</h3>
+            <div class="legend">
+              <span><i class="dot dot-answered"></i>已回复</span>
+              <span><i class="dot dot-open"></i>进行中</span>
+              <span><i class="dot dot-blocked"></i>已阻塞</span>
+            </div>
+          </div>
+          <div id="flowGraph" class="flow-graph">
+            <div class="flow-empty">选择任务后显示 Agent 协作拓扑</div>
+          </div>
+        </div>
+
+        <div class="card card-tabs">
+          <div class="tab-bar">
+            <button class="tab active" data-tab="requests">💬 对话请求</button>
+            <button class="tab" data-tab="resources">📦 共享资源</button>
+            <button class="tab" data-tab="activity">📝 活动日志</button>
+          </div>
+
+          <!-- 请求面板 -->
+          <div class="tab-content active" id="tab-requests">
+            <div class="filter-bar">
+              <select id="agentFilter" class="input-sm">
+                <option value="">所有 Agent</option>
+              </select>
+              <span class="filter-hint">按发起方/接收方筛选</span>
+            </div>
+            <div id="requestList" class="scroll-list"></div>
+          </div>
+
+          <!-- 资源面板 -->
+          <div class="tab-content" id="tab-resources">
+            <div class="filter-bar">
+              <select id="resourceFilter" class="input-sm">
+                <option value="">所有者</option>
+              </select>
+            </div>
+            <div id="resourceList" class="scroll-list"></div>
+          </div>
+
+          <!-- 活动面板 -->
+          <div class="tab-content" id="tab-activity">
+            <div id="activityList" class="scroll-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── 右栏：配置与发号施令 ── -->
+      <section class="col-right">
+        <!-- API 配置 -->
+        <div class="card card-api" style="margin-bottom: 16px;">
+          <div class="card-header">
+            <h3>⚙️ API 配置</h3>
+            <span class="status-badge badge-warning" id="apiStatusBadge">未验证</span>
+          </div>
+
+          <label class="field-label" for="runnerProtocol">API 协议类型</label>
+          <select id="runnerProtocol">
+            <option value="openai">OpenAI 兼容协议</option>
+          </select>
+
+          <label class="field-label" for="runnerBaseUrl">接口地址 (Base URL)</label>
+          <input id="runnerBaseUrl" placeholder="例如：https://api.openai.com/v1" />
+
+          <label class="field-label" for="runnerModel">模型名称</label>
+          <input id="runnerModel" placeholder="例如：gpt-4o, qwen-max, deepseek-chat" />
+
+          <label class="field-label" for="runnerApiKey">API Key</label>
+          <input id="runnerApiKey" type="password" placeholder="sk-..." />
+          
+          <div class="form-check" style="margin-top: 6px; margin-bottom: 10px;">
+            <label>
+              <input id="rememberApiKey" type="checkbox" />
+              <span>记住 API Key (仅保存在本地浏览器)</span>
+            </label>
+          </div>
+
+          <button class="btn-ghost" id="verifyApiBtn" style="width: 100%;">验证连接</button>
+        </div>
+
+	        <!-- Agent 创建 / 添加 -->
+	        <div class="card">
+	          <div class="card-header">
+	            <h3>添加 Agent</h3>
+	            <span class="status-badge badge-muted" id="agentCreateBadge">角色库</span>
+	          </div>
+
+	          <label class="field-label" for="agentNameInput">Agent ID</label>
+	          <input id="agentNameInput" placeholder="例如：data_analyst" />
+
+	          <label class="field-label" for="agentTitleInput">显示名称</label>
+	          <input id="agentTitleInput" placeholder="例如：Data Analyst" />
+
+	          <label class="field-label" for="agentMissionInput">职责说明</label>
+	          <textarea id="agentMissionInput" class="textarea-sm" placeholder="描述这个 agent 的职责、可交付产物，以及它应该向 Leader 回写什么。"></textarea>
+
+	          <button id="agentCreateButton" class="btn-primary">创建 / 添加 Agent</button>
+	          <p id="agentCreateStatus" class="send-status"></p>
+	          <div id="agentProfileList" class="profile-list"></div>
+	        </div>
+
+        <!-- Leader 摘要 -->
+        <div class="card">
+          <div class="card-header">
+            <h3>📑 Leader 摘要</h3>
+          </div>
+          <pre id="summaryText" class="code-block">暂无摘要</pre>
+        </div>
+      </section>
+    </div>
+
+    <!-- ═══════════ 待处理项目弹窗 ═══════════ -->
+    <div class="modal-overlay" id="pendingModal">
+      <div class="modal-dialog pending-dialog">
+        <div class="modal-header">
+          <h2>待处理项目</h2>
+          <button class="btn-ghost modal-close" id="closePendingModalBtn">✕</button>
+        </div>
+        <div class="modal-body pending-body">
+          <div class="pending-toolbar">
+            <span id="pendingModalSummary">暂无待处理项目</span>
+            <button class="btn-ghost-sm" id="refreshPendingBtn">刷新</button>
+          </div>
+          <div id="pendingList" class="pending-list"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════ 新建任务弹窗 ═══════════ -->
+    <div class="modal-overlay" id="createTaskModal">
+      <div class="modal-dialog">
+        <div class="modal-header">
+          <h2>✨ 新建任务</h2>
+          <button class="btn-ghost modal-close" id="closeModalBtn">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="field-label" for="newTaskTitle">任务标题 <span class="required">*</span></label>
+            <input id="newTaskTitle" type="text" placeholder="例如：分数阶PINN参数辨识" autofocus />
+            <p class="field-hint">描述你要完成的科研或工程项目</p>
+          </div>
+
+          <div class="form-group">
+            <label class="field-label" for="newTaskSlug">目录名称 (slug)</label>
+            <input id="newTaskSlug" type="text" placeholder="自动从标题生成，可手动修改" />
+            <p class="field-hint">用于创建 tasks/ 下的子目录，仅限英文字母、数字和连字符</p>
+          </div>
+
+          <div class="form-group">
+            <label class="field-label" for="newTaskAgents">参与 Agent</label>
+            <input id="newTaskAgents" type="text" placeholder="leader,literature_collector,mathematician,code_expert,latex_writer" value="leader,literature_collector,mathematician,code_expert,latex_writer" />
+            <p class="field-hint">逗号分隔的 Agent 名称，将创建对应的角色笔记和日志模板</p>
+          </div>
+
+          <div class="form-group form-check">
+            <label>
+              <input id="newTaskForce" type="checkbox" />
+              <span>覆盖已有目录</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn-ghost" id="cancelModalBtn">取消</button>
+          <button type="button" class="btn-primary modal-submit" id="submitCreateBtn">创建任务</button>
+          <p class="send-status" id="createTaskStatus"></p>
+        </div>
+      </div>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
