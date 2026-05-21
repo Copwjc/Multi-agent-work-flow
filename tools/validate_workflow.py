@@ -8,22 +8,28 @@ fresh Codex workspaces without installing dependencies.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+LEGACY_TASK_PATHS = {
+    "logs/inter_agent_dialogue.md",
+    "logs/request_ledger.json",
+    "notes/request_priorities.json",
+}
 
 REQUIRED_PATHS = [
     "README.md",
     "workflow/protocol.md",
     "docs/super_admin_override.md",
-    "docs/inter_agent_dialogue.md",
     "agents/leader.md",
     "agents/literature_collector.md",
     "agents/mathematician.md",
     "agents/code_expert.md",
     "agents/latex_writer.md",
     "tools/create_task.py",
+    "tools/agent_process_worker.py",
     "tools/multiagent_gui.py",
     "tools/multiagent_web.py",
     "tools/web_gui/index.html",
@@ -31,30 +37,53 @@ REQUIRED_PATHS = [
     "tools/web_gui/app.js",
     "templates/task_brief.md",
     "templates/agent_interactions.md",
-    "templates/inter_agent_dialogue.md",
     "templates/literature_review.md",
     "templates/leader_summary.md",
     "templates/override_directive.md",
     "templates/resource_registry.md",
     "docs/workflow_checklist.md",
+    "logs/agent_interactions.md",
+    "notes/leader_summary.md",
 ]
 
 TASK_REQUIRED_PATHS = [
     "README.md",
-    "src/solution.py",
-    "tests/test_solution.py",
-    "experiments/run_experiment.py",
-    "experiments/analysis.md",
+    "notes/task_manifest.json",
     "report/main.tex",
     "notes/task_brief.md",
     "notes/literature_review.md",
     "notes/leader_summary.md",
     "notes/resource_registry.md",
     "logs/agent_interactions.md",
-    "logs/inter_agent_dialogue.md",
     "logs/override_log.md",
     "logs/run_log.md",
 ]
+
+
+def load_manifest_paths(task_root: Path) -> list[str]:
+    path = task_root / "notes" / "task_manifest.json"
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    artifacts = raw.get("artifacts", {}) if isinstance(raw, dict) else {}
+    if not isinstance(artifacts, dict):
+        return []
+    rel_paths: list[str] = []
+    for value in artifacts.values():
+        if isinstance(value, str):
+            text = value.strip()
+            if text and text not in LEGACY_TASK_PATHS:
+                rel_paths.append(text)
+            continue
+        if isinstance(value, list):
+            for item in value:
+                text = str(item).strip()
+                if text and text not in LEGACY_TASK_PATHS:
+                    rel_paths.append(text)
+    return sorted(set(rel_paths))
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,7 +130,8 @@ def main() -> int:
 
     if args.task:
         task_root = ROOT / "tasks" / args.task
-        task_missing, task_empty = collect_missing_or_empty(task_root, TASK_REQUIRED_PATHS)
+        task_paths = sorted(set(TASK_REQUIRED_PATHS + load_manifest_paths(task_root)))
+        task_missing, task_empty = collect_missing_or_empty(task_root, task_paths)
         if task_missing or task_empty:
             print(f"\nTask validation failed for {args.task}.")
             if task_missing:
@@ -114,7 +144,7 @@ def main() -> int:
                     print(f"- {rel_path}")
             return 1
         print(f"Task validation passed for {args.task}.")
-        print(f"Checked {len(TASK_REQUIRED_PATHS)} task paths.")
+        print(f"Checked {len(task_paths)} task paths.")
     return 0
 
 

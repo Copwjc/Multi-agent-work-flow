@@ -47,9 +47,10 @@ TODO: outline the final LaTeX paper sections, figures, tables, and citations.
 
 - Literature review maintained in `notes/literature_review.md`.
 - Mathematical reasoning checked against edge cases.
-- Algorithm implemented under `src/`.
-- Tests added under `tests/`.
+- Algorithm implemented under `experiments/src/`.
+- Tests added under `experiments/tests/`.
 - Experiments are reproducible from `experiments/`.
+- Task structure declared in `notes/task_manifest.json`.
 - Results and limitations summarized in `notes/leader_summary.md`.
 - Paper draft maintained in `report/main.tex`.
 - Any Super Admin Override is reflected in `notes/override_directive.md` and `logs/override_log.md`.

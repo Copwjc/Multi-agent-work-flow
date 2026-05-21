@@ -43,11 +43,16 @@
 		        <input id="groupCommandInput" placeholder="输入新的目标、纠偏或继续推进要求；将由 Leader 拆解并重新安排各 Agent" />
 		      </div>
 		      <button id="groupCommandButton" class="btn-primary">发送给 Leader</button>
-		      <label class="auto-play-inline" title="自动处理 open request">
-		        <input type="checkbox" id="autoPlayToggle" checked />
-		        <span>自动接力</span>
-		      </label>
-		      <span id="groupCommandStatus" class="send-status"></span>
+	      <label class="auto-play-inline" title="自动处理 open request">
+	        <input type="checkbox" id="autoPlayToggle" checked />
+	        <span>自动接力</span>
+	      </label>
+	      <div class="run-controls">
+	        <button id="continueTaskButton" class="btn-control">继续任务</button>
+	        <button id="interruptRunsButton" class="btn-control btn-danger-soft">中断任务</button>
+	        <button id="restartServerButton" class="btn-control">重启服务器</button>
+	      </div>
+	      <span id="groupCommandStatus" class="send-status"></span>
 		    </section>
 
 	    <!-- ═══════════ 统计卡片 ═══════════ -->
@@ -170,7 +175,7 @@
           <div class="form-check" style="margin-top: 6px; margin-bottom: 10px;">
             <label>
               <input id="rememberApiKey" type="checkbox" />
-              <span>记住 API Key (仅保存在本地浏览器)</span>
+              <span>记住 API Key (保存在本地浏览器)</span>
             </label>
           </div>
 
@@ -235,7 +240,7 @@
         <div class="modal-body">
           <div class="form-group">
             <label class="field-label" for="newTaskTitle">任务标题 <span class="required">*</span></label>
-            <input id="newTaskTitle" type="text" placeholder="例如：分数阶PINN参数辨识" autofocus />
+            <input id="newTaskTitle" type="text" placeholder="例如：最短路径证明" autofocus />
             <p class="field-hint">描述你要完成的科研或工程项目</p>
           </div>
 

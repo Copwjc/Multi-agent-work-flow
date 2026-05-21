@@ -8,6 +8,7 @@ Windows and Linux without project setup.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import textwrap
@@ -39,12 +40,13 @@ AGENT_ALIASES = {
 }
 
 DIRECTORIES = (
-    "src",
-    "tests",
     "experiments",
+    "experiments/src",
+    "experiments/tests",
+    "experiments/data",
     "experiments/outputs",
+    "experiments/figures",
     "report",
-    "report/figures",
     "notes",
     "logs",
 )
@@ -52,7 +54,6 @@ DIRECTORIES = (
 TEMPLATE_DESTINATIONS = {
     "task_brief.md": ("README.md", "notes/task_brief.md"),
     "agent_interactions.md": ("logs/agent_interactions.md",),
-    "inter_agent_dialogue.md": ("logs/inter_agent_dialogue.md",),
     "literature_review.md": ("notes/literature_review.md",),
     "leader_summary.md": ("notes/leader_summary.md",),
     "override_directive.md": ("notes/override_directive.md",),
@@ -156,9 +157,49 @@ def latex_escape(value: str) -> str:
 def generated_files(title: str, slug: str, agents: List[str]) -> Dict[str, str]:
     agent_comments = "\n".join(f"# - {agent}: TODO" for agent in agents)
     latex_title = latex_escape(title)
+    manifest = {
+        "version": 1,
+        "slug": slug,
+        "title": title,
+        "agents": agents,
+        "artifacts": {
+            "task_brief": ["notes/task_brief.md"],
+            "literature_review": ["notes/literature_review.md"],
+            "leader_summary": ["notes/leader_summary.md"],
+            "resource_registry": ["notes/resource_registry.md"],
+            "workflow_store": ["logs/workflow.db"],
+            "interaction_log": ["logs/agent_interactions.md"],
+            "override_log": ["logs/override_log.md"],
+            "run_log": ["logs/run_log.md"],
+            "code": ["experiments/src/solution.py"],
+            "tests": ["experiments/tests/test_solution.py"],
+            "experiments": ["experiments/run_experiment.py", "experiments/analysis.md"],
+            "report": ["report/main.tex"],
+        },
+        "entrypoints": {
+            "python_candidates": [
+                "experiments/.venv/bin/python",
+                ".venv/bin/python",
+                "venv/bin/python",
+                "experiments/.venv/Scripts/python.exe",
+                ".venv/Scripts/python.exe",
+                "venv/Scripts/python.exe",
+            ],
+            "test_commands": ["python -m unittest discover -s tests -v"],
+            "report_commands": ["pdflatex main.tex"],
+            "experiment_cwd": "experiments",
+            "report_cwd": "report",
+        },
+        "workflow": {
+            "primary_code_artifacts": ["experiments/src/solution.py"],
+            "primary_test_artifacts": ["experiments/tests/test_solution.py"],
+            "analysis_artifacts": ["experiments/run_experiment.py", "experiments/analysis.md"],
+            "report_artifacts": ["report/main.tex", "notes/leader_summary.md"],
+        },
+    }
     return {
-        "src/__init__.py": '"""Solution package for this task workspace."""\n',
-        "src/solution.py": textwrap.dedent(
+        "experiments/src/__init__.py": '"""Solution package for this task workspace."""\n',
+        "experiments/src/solution.py": textwrap.dedent(
             f"""\
             \"\"\"Algorithm implementation entry point for {title}.\"\"\"
 
@@ -174,10 +215,10 @@ def generated_files(title: str, slug: str, agents: List[str]) -> Dict[str, str]:
 
 
             if __name__ == "__main__":
-                print("Implement a CLI or smoke check in src/solution.py")
+                print("Implement a CLI or smoke check in experiments/src/solution.py")
             """
         ),
-        "tests/test_solution.py": textwrap.dedent(
+        "experiments/tests/test_solution.py": textwrap.dedent(
             """\
             import unittest
 
@@ -309,6 +350,7 @@ def generated_files(title: str, slug: str, agents: List[str]) -> Dict[str, str]:
             {agent_comments}
             """
         ),
+        "notes/task_manifest.json": json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
     }
 
 
@@ -343,6 +385,12 @@ def create_workspace(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if task_dir.exists() and args.force:
+        print(
+            "WARNING: --force overwrites generated files with template TODO sections. "
+            "Fill the task brief before starting the workflow.",
+            file=sys.stderr,
+        )
 
     created_at = utc_now()
     values = {

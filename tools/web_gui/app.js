@@ -39,7 +39,8 @@ function normStatus(s) {
 function statusBadgeClass(status) {
   const s = normStatus(status);
   if (s === "answered" || s === "accepted" || s === "logged" || s === "finished") return "badge-success";
-  if (s === "blocked" || s === "invalidated" || s === "failed") return "badge-danger";
+  if (s === "blocked" || s === "invalidated" || s === "failed" || s === "cancelled") return "badge-danger";
+  if (s === "skipped") return "badge-success";
   return "badge-warning"; // open, running, queued
 }
 
@@ -48,6 +49,7 @@ function statusLabel(status) {
     open: "进行中", answered: "已回复", accepted: "已接受",
     blocked: "已阻塞", invalidated: "已失效", queued: "排队中",
     running: "运行中", finished: "已完成", failed: "失败", logged: "已记录",
+    cancelled: "已中断", skipped: "已跳过"
   };
   return map[normStatus(status)] || normStatus(status);
 }
@@ -311,45 +313,72 @@ function checkAutoPlay(task) {
     return;
   }
   
-  // Check if any agent is currently running
-  const isRunning = task.runs && task.runs.some(r => r.status === "running");
-  if (isRunning) return;
+  // 并发限制检查
+  const maxConcurrent = task.max_concurrent || 3;
+  const activeRuns = (task.runs || []).filter(r => r.status === "running" || r.status === "queued");
+  if (activeRuns.length >= maxConcurrent) {
+    if (status) status.textContent = `自动接力等待：运行中任务已达上限 ${maxConcurrent}。`;
+    return;
+  }
   
-  // Find an open request
+  // 寻找所有可运行的请求
   if (!task.requests) return;
-  const openReq = pendingRequests(task).find(r => (
+  const openReqs = allRunnableRequests(task);
+  
+  // 遍历寻找第一个既没有在运行，也没有被锁定的请求来执行
+  let toDispatch = null;
+  for (const req of openReqs) {
+    const requestId = req.request_id || "";
+    const existingRun = (task.runs || []).find(r => (
+      r.request_id === requestId && (r.status === "queued" || r.status === "running")
+    ));
+    if (existingRun) {
+      state.autoPlayLocks.set(requestId, Date.now());
+      continue; // 此请求已在运行，检查下一个
+    }
+    const lockedAt = state.autoPlayLocks.get(requestId);
+    if (lockedAt && Date.now() - lockedAt < 120000) {
+      continue; // 此请求最近已提交，正在排队，检查下一个
+    }
+    toDispatch = req;
+    break; // 找到了一个可以启动的请求
+  }
+
+  if (toDispatch) {
+    const requestId = toDispatch.request_id || "";
+    state.autoPlayLocks.set(requestId, Date.now());
+    const prompt = promptForRequest(toDispatch);
+    if (status) status.textContent = `自动接力准备启动：${requestId} → ${toDispatch.to}`;
+ 
+    setTimeout(() => {
+      if ($("autoPlayToggle").checked) {
+        const payload = apiConfigPayload(prompt, toDispatch.to, "execute");
+        startRunnerPayload(payload, { requestId, statusEl: status });
+      }
+    }, 1500);
+  } else {
+    if (status && activeRuns.length === 0) {
+      status.textContent = "自动接力就绪：暂无待处理任务。";
+    }
+  }
+}
+
+function allRunnableRequests(task) {
+  return pendingRequests(task).filter(r => (
     normStatus(r.status) === "open"
     && r.request_id !== "TODO"
     && String(r.need || "").trim().toUpperCase() !== "TODO"
     && r.to !== "user"
     && r.to !== "workflow"
   ));
-	  if (openReq) {
-    const requestId = openReq.request_id || "";
-    const existingRun = (task.runs || []).find(r => (
-      r.request_id === requestId && (r.status === "queued" || r.status === "running")
-	    ));
-    if (existingRun) {
-      state.autoPlayLocks.set(requestId, Date.now());
-      if (status) status.textContent = `自动接力等待：${requestId} 已在 ${existingRun.run_id} 中运行。`;
-      return;
-    }
-    const lockedAt = state.autoPlayLocks.get(requestId);
-    if (lockedAt && Date.now() - lockedAt < 120000) {
-      if (status) status.textContent = `自动接力等待：${requestId} 已提交，等待后台状态更新。`;
-      return;
-    }
-    state.autoPlayLocks.set(requestId, Date.now());
-    const prompt = `请处理派发给你的任务：\nRequest ID: ${openReq.request_id}\n来自: ${openReq.from}\n需求: ${openReq.need}\n\n完成后请务必更新 logs/inter_agent_dialogue.md，将此任务的状态改为 answered 或 accepted。`;
-    if (status) status.textContent = `自动接力准备启动：${requestId} → ${openReq.to}`;
+}
 
-    setTimeout(() => {
-      if ($("autoPlayToggle").checked) {
-        const payload = apiConfigPayload(prompt, openReq.to, "execute");
-        startRunnerPayload(payload, { requestId, statusEl: status });
-      }
-    }, 1500);
-  }
+function nextRunnableRequest(task) {
+  return allRunnableRequests(task)[0] || null;
+}
+
+function promptForRequest(req) {
+  return `请处理派发给你的任务：\nRequest ID: ${req.request_id}\n来自: ${req.from}\n需求: ${req.need}\n\n请把实际产物写入对应任务文件；不要手动编辑 workflow ledger，后端状态机会在运行完成后更新 request 状态并派发后续任务。`;
 }
 
 function apiConfigPayload(prompt, role = "leader", mode = "execute") {
@@ -523,6 +552,28 @@ function renderFlow(task) {
   }
   container.appendChild(svg);
 
+  const hasRunning = (task.runs || []).some(r => r.status === "running");
+  const hasPending = task.requests.some(r => ["open", "queued", "blocked"].includes(normStatus(r.status)));
+  
+  let globalStatusText = "已完成";
+  let globalStatusBg = "var(--success)";
+  if (hasRunning) {
+    globalStatusText = "进行中";
+    globalStatusBg = "var(--warning)";
+  } else if (hasPending) {
+    globalStatusText = "待命中";
+    globalStatusBg = "var(--danger)";
+  }
+
+  const statsNode = document.createElement("div");
+  statsNode.className = "flow-stats-overlay";
+  statsNode.innerHTML = `
+    <div class="stat-item" style="font-weight:bold; font-size: 1rem;">
+      总任务状态: <span class="badge" style="background:${globalStatusBg}; font-size: 0.9rem; margin-left: 6px;">${globalStatusText}</span>
+    </div>
+  `;
+  container.appendChild(statsNode);
+
   // Agent 节点
   for (const a of agents) {
     const p = pos[a];
@@ -572,6 +623,8 @@ function renderRequests(task) {
         <span>${esc(r.type || "")}</span>
       </div>
       <div class="card-body">${esc(r.need || "无描述")}</div>
+      ${r.context ? `<div class="request-context">${esc(r.context)}</div>` : ""}
+      ${r.note ? `<div class="request-context"><strong>处理备注:</strong><br>${esc(r.note)}</div>` : ""}
       <div class="card-footer">
         <span>${esc(r.request_id || "")}</span>
         ${r.parent && r.parent !== "none" ? `<span>父: ${esc(r.parent)}</span>` : ""}
@@ -619,6 +672,8 @@ function renderPendingModal(task) {
           <span>${esc(item.type || "")}</span>
         </div>
         <div class="pending-need">${esc(item.need || "无描述")}</div>
+        ${item.context ? `<div class="pending-context">${esc(item.context)}</div>` : ""}
+        ${item.note ? `<div class="pending-context"><strong>处理备注:</strong><br>${esc(item.note)}</div>` : ""}
         <div class="pending-footer">
           <span>${esc(item.request_id || "")}</span>
           ${item.parent && item.parent !== "none" ? `<span>父: ${esc(item.parent)}</span>` : ""}
@@ -916,30 +971,34 @@ async function submitGroupCommand() {
   status.textContent = "正在交给 Leader...";
 
   try {
-    await fetchJson(`/api/tasks/${encodeURIComponent(state.selectedSlug)}/interventions`, {
+    const intervention = await fetchJson(`/api/tasks/${encodeURIComponent(state.selectedSlug)}/interventions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         type: "instruction",
         target: "leader",
         parent: "none",
-        artifact: "logs/agent_interactions.md",
+        artifact: "logs/workflow.db",
         message: `用户对整个 agent 工作组下发命令：\n${message}`,
       }),
     });
+    if (intervention.request_id) {
+      state.autoPlayLocks.set(intervention.request_id, Date.now());
+    }
 
     const leaderPrompt = [
       "用户对整个 agent 工作组下发了新的总控命令。",
+      intervention.request_id ? `Request ID: ${intervention.request_id}` : "",
       "",
       "请你以 Leader 角色处理：",
       "1. 重新解释用户目标和验收标准。",
       "2. 检查当前 open/blocked 请求，决定保留、关闭、重排或新增。",
-      "3. 必须把新的任务拆解写入 logs/inter_agent_dialogue.md，让对应 specialist agent 继续执行。",
-      "4. 不要把所有工作留给 Leader 自己完成。",
+      "3. 输出面向 specialist agent 的拆解方案，包含 Need 和 Artifact / Resource；后端状态机会负责创建结构化 request。",
+      "4. 不要手动编辑 workflow ledger，也不要把所有工作留给 Leader 自己完成。",
       "",
       "用户命令：",
       message,
-    ].join("\n");
+    ].filter(Boolean).join("\n");
 
     const result = await fetchJson(`/api/tasks/${encodeURIComponent(state.selectedSlug)}/runs`, {
       method: "POST",
@@ -993,11 +1052,97 @@ async function createAgent() {
   }
 }
 
+async function continueNextTask() {
+  const status = $("groupCommandStatus");
+  if (!state.task || !state.selectedSlug) {
+    if (status) status.textContent = "请先选择任务";
+    return;
+  }
+  if (!hasApiConfig()) {
+    if (status) status.textContent = "请先填写 API 地址、模型和 API Key";
+    return;
+  }
+  const isRunning = (state.task.runs || []).some((r) => r.status === "running" || r.status === "queued");
+  if (isRunning) {
+    if (status) status.textContent = "已有任务正在运行或排队，先中断或等待完成。";
+    return;
+  }
+  const req = nextRunnableRequest(state.task);
+  if (!req) {
+    if (status) status.textContent = "没有可继续的 open request。";
+    return;
+  }
+  const requestId = req.request_id || "";
+  state.autoPlayLocks.set(requestId, Date.now());
+  if (status) status.textContent = `手动继续：${requestId} → ${req.to}`;
+  await startRunnerPayload(apiConfigPayload(promptForRequest(req), req.to, "execute"), { requestId, statusEl: status });
+}
+
+async function interruptRuns() {
+  const status = $("groupCommandStatus");
+  if (!state.selectedSlug) {
+    if (status) status.textContent = "请先选择任务";
+    return;
+  }
+  const btn = $("interruptRunsButton");
+  btn.disabled = true;
+  if (status) status.textContent = "正在中断运行/排队任务...";
+  try {
+    const result = await fetchJson(`/api/tasks/${encodeURIComponent(state.selectedSlug)}/runs/interrupt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    if (status) status.textContent = result.cancelled?.length
+      ? `已中断：${result.cancelled.join(", ")}`
+      : "当前没有运行或排队任务。";
+    await loadTaskState(state.selectedSlug);
+  } catch (err) {
+    if (status) status.textContent = `中断失败：${err.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function restartServer() {
+  const status = $("groupCommandStatus");
+  const btn = $("restartServerButton");
+  btn.disabled = true;
+  if (status) status.textContent = "服务器正在重启...";
+  try {
+    await fetchJson("/api/server/restart", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+  } catch {
+    // The connection may close while the process execs itself.
+  }
+
+  for (let i = 0; i < 40; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    try {
+      await fetchJson("/api/tasks");
+      if (status) status.textContent = "服务器已重启。";
+      btn.disabled = false;
+      if (state.selectedSlug) await loadTaskState(state.selectedSlug);
+      return;
+    } catch {
+      if (status) status.textContent = `服务器正在重启... ${i + 1}`;
+    }
+  }
+  if (status) status.textContent = "服务器重启后暂未响应，请手动刷新页面。";
+  btn.disabled = false;
+}
+
 /* ── 启动 Runner ── */
 async function startRunnerPayload(payload, options = {}) {
   const status = options.statusEl || $("groupCommandStatus");
   const requestId = options.requestId || promptRequestId(payload.prompt);
-  if (state.runnerBusy) return;
+  if (state.runnerBusy) {
+    if (status) status.textContent = "Runner 正在启动，请稍候。";
+    return;
+  }
   if (requestId) {
     const existingRun = (state.task?.runs || []).find(r => (
       r.request_id === requestId && (r.status === "queued" || r.status === "running")
@@ -1122,6 +1267,9 @@ $("groupCommandInput").addEventListener("keydown", (e) => {
 $("verifyApiBtn").addEventListener("click", verifyApi);
 $("agentCreateButton").addEventListener("click", createAgent);
 $("themeToggle").addEventListener("click", toggleTheme);
+$("continueTaskButton").addEventListener("click", continueNextTask);
+$("interruptRunsButton").addEventListener("click", interruptRuns);
+$("restartServerButton").addEventListener("click", restartServer);
 $("pendingStatCard").addEventListener("click", openPendingModal);
 $("pendingStatCard").addEventListener("keydown", (e) => {
   if (e.key === "Enter" || e.key === " ") {

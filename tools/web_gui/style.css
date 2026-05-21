@@ -150,7 +150,7 @@ body {
   top: var(--topbar-h);
   z-index: 90;
   display: grid;
-  grid-template-columns: minmax(280px, 1fr) auto auto minmax(140px, auto);
+  grid-template-columns: minmax(280px, 1fr) auto auto auto minmax(140px, auto);
   align-items: end;
   gap: 10px;
   padding: 10px 20px;
@@ -198,6 +198,46 @@ body {
   width: 16px;
   height: 16px;
   accent-color: var(--accent);
+}
+
+.run-controls {
+  display: inline-flex;
+  gap: 6px;
+  align-self: end;
+  min-height: 36px;
+}
+
+.btn-control {
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+
+.btn-control:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.btn-control:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-danger-soft {
+  border-color: var(--danger-soft);
+  color: var(--danger);
+}
+
+.btn-danger-soft:hover {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .topbar-right {
@@ -1227,6 +1267,50 @@ button {
   .auto-play-inline {
     justify-content: center;
   }
+  .run-controls {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    width: 100%;
+  }
+  .btn-control {
+    min-height: 34px;
+  }
 	  .stats-bar { flex-wrap: wrap; }
 	  .stat-card { min-width: 80px; }
 	}
+
+.request-context, .pending-context {
+  margin-top: 8px;
+  padding: 8px;
+  background: var(--bg-tertiary);
+  border-left: 3px solid var(--border);
+  font-family: monospace;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.flow-stats-overlay {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(4px);
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.stat-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+}

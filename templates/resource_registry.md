@@ -27,7 +27,7 @@ blocking dependencies that another agent may need.
 
 ## Usage Rules
 
-- Agents may request a resource directly in `logs/inter_agent_dialogue.md`.
+- Agents may request a resource directly in `backend workflow state`.
 - Resource owners should answer with a concrete path, command, citation, or
   reason the resource is unavailable.
 - If a resource is stale, invalidated, private, unsafe, or outside scope, mark it

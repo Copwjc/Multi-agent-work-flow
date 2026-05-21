@@ -14,7 +14,7 @@
 - [ ] 实验验证路径包含数据来源或生成方式、可复现实验命令、预期指标和结果解释。
 - [ ] LaTeX 论文报告路径包含问题陈述、方法、算法、实验、讨论和可复现附录。
 - [ ] 内部交互日志概述 agent 协作过程，且不暴露敏感凭据或不必要的原始草稿。
-- [ ] agent 间请求、回复、证据链和阻塞点记录在 `logs/inter_agent_dialogue.md`，包含稳定 Request ID 和 Parent 依赖。
+- [ ] agent 间请求、回复、证据链和阻塞点记录在 `backend workflow state`，包含稳定 Request ID 和 Parent 依赖。
 - [ ] agent 可直接互相请求资源或验证，不必全部经过 Leader；会影响最终 claim 的冲突再升级给 Leader。
 - [ ] 共享资源记录在 `notes/resource_registry.md`，包括 owner、路径、状态和可复用范围。
 - [ ] 用户 Super Admin Override 机制已定义，包含触发方式、优先级、日志记录和恢复执行流程。
@@ -41,7 +41,7 @@
 - [ ] 生成的结果文件、表格或图形。
 - [ ] LaTeX 源文件，以及编译出的 PDF 或编译命令。
 - [ ] `logs/agent_interactions.md` 中的简要协作记录。
-- [ ] `logs/inter_agent_dialogue.md` 中的证据请求链，尤其是报告 claim、实验结果和数学假设之间的链路。
+- [ ] `backend workflow state` 中的证据请求链，尤其是报告 claim、实验结果和数学假设之间的链路。
 - [ ] `notes/resource_registry.md` 中的数据、脚本、结果、引用、证明和报告资源状态。
 - [ ] 文献相关 claim 能追溯到 Literature Collector 的来源记录或明确标记为未验证。
 - [ ] 若发生 Super Admin Override，`logs/override_log.md` 和 `notes/override_directive.md` 已记录纠偏内容、受影响产物和新验收标准。

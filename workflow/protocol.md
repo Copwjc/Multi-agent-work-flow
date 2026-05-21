@@ -36,7 +36,7 @@ support from each other without waiting for a Leader relay.
 7. A User Super Admin Override supersedes Leader plans, worker suggestions, and
    default templates, while still respecting system, safety, and tool limits.
 8. Agent-to-agent evidence requests are recorded in
-   `tasks/<slug>/logs/inter_agent_dialogue.md` with a stable request id and
+   the backend workflow state with a stable request id and
    parent request when one request depends on another.
 9. Agents may ask other agents for resources directly when the request is
    bounded, artifact-linked, and relevant to the current task. The recipient may
@@ -46,6 +46,12 @@ support from each other without waiting for a Leader relay.
     formula, ask Mathematician; if it is executable evidence, ask Code Expert;
     if it is report integration, ask LaTeX Writer; if it is scheduling, scope,
     authority, or conflict resolution, ask Leader.
+11. All task-local code, tests, datasets, experiment outputs, and generated
+    figures/images must be stored under `tasks/<slug>/experiments/`. Use
+    `experiments/src/`, `experiments/tests/`, `experiments/data/`,
+    `experiments/outputs/`, and `experiments/figures/` respectively. Reports and
+    notes may stay in `report/` and `notes/`, but report figures should point to
+    the experiment figure artifacts instead of creating new images elsewhere.
 
 ## Collaborative Agent Mesh
 
@@ -106,7 +112,7 @@ reports there when another agent is likely to reuse them.
 
 ## Inter-Agent Dialogue
 
-Use `inter_agent_dialogue.md` when one specialist needs evidence or validation
+Use backend workflow state when one specialist needs evidence or validation
 from another specialist. Common chains include:
 
 1. Leader requests a literature map from Literature Collector.

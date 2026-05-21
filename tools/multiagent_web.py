@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -59,14 +60,22 @@ def _get_create_task() -> Any:
     return _create_task_module
 RUNS: dict[str, dict[str, Any]] = {}
 RUN_LOCK = threading.Lock()
+CANCELLED_RUNS: set[str] = set()
+REQUEST_LOCK = threading.RLock()
+RUN_PROCESSES: dict[str, subprocess.Popen[str]] = {}
+RUN_PROCESS_LOCK = threading.Lock()
 
-# ── 并发控制：最多同时运行 2 个 Agent ──
-MAX_CONCURRENT_RUNS = 2
+# ── 并发控制：解除并行限制，允许高并发 ──
+MAX_CONCURRENT_RUNS = 100
 _RUN_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_RUNS)
 
 # ── 共享 httpx 客户端（连接池复用）──
 _shared_http_client: httpx.Client | None = None
 _http_client_lock = threading.Lock()
+
+
+class RunCancelled(RuntimeError):
+    """Raised when the user cancels a running agent task."""
 
 
 def require_httpx() -> None:
@@ -89,7 +98,7 @@ def get_http_client() -> httpx.Client:
         with _http_client_lock:
             if _shared_http_client is None or _shared_http_client.is_closed:
                 _shared_http_client = httpx.Client(
-                    timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0),
+                    timeout=httpx.Timeout(connect=30.0, read=1800.0, write=30.0, pool=30.0),
                     limits=httpx.Limits(max_connections=MAX_CONCURRENT_RUNS, max_keepalive_connections=MAX_CONCURRENT_RUNS),
                     follow_redirects=True,
                 )
@@ -99,7 +108,8 @@ def get_http_client() -> httpx.Client:
 DEFAULT_AGENTS_LIST = ("leader", "literature", "math", "algorithm", "experiment", "latex")
 REQUEST_RETRY_COOLDOWN_SECONDS = 60
 MAX_LOCAL_COMMANDS_PER_RUN = 10
-LOCAL_COMMAND_TIMEOUT_SECONDS = 180
+API_VERIFY_TIMEOUT_SECONDS = 1800
+LOCAL_COMMAND_TIMEOUT_SECONDS = 3600
 LOCAL_COMMAND_OUTPUT_LIMIT = 12000
 
 ROLE_ALIASES = {
@@ -141,20 +151,32 @@ VALID_INTERVENTION_TYPES = {
     "super_admin_override",
 }
 
-WATCHED_TASK_PATHS = (
+CORE_WATCHED_TASK_PATHS = (
     "README.md",
     "logs/agent_interactions.md",
-    "logs/inter_agent_dialogue.md",
     "logs/override_log.md",
+    "logs/workflow.db",
     "notes/task_brief.md",
     "notes/leader_summary.md",
     "notes/resource_registry.md",
-    "notes/request_priorities.json",
+    "notes/task_manifest.json",
     "notes/override_directive.md",
-    "experiments/analysis.md",
-    "experiments/outputs/latest.json",
-    "report/main.tex",
     "report/main.pdf",
+)
+
+WATCHED_TASK_DIRS = (
+    "logs/agent_runs",
+    "experiments/outputs",
+    "experiments/figures",
+    "report/figures",
+)
+
+LEGACY_WORKFLOW_STATE_PATHS = (
+    "logs/request_ledger.json",
+    "logs/inter_agent_dialogue.md",
+    "notes/request_priorities.json",
+    "logs/workflow_state.json",
+    "logs/dispatch_queue.json",
 )
 
 
@@ -172,24 +194,177 @@ def task_root(slug: str) -> Path:
     return ROOT / "tasks" / safe_slug
 
 
+def task_manifest_path(base: Path) -> Path:
+    return base / "notes" / "task_manifest.json"
+
+
+def workflow_store_path(base: Path) -> Path:
+    return base / "logs" / "workflow.db"
+
+
+def default_task_manifest(base: Path) -> dict[str, Any]:
+    slug = base.name
+    python_candidates = [
+        "experiments/.venv/bin/python",
+        ".venv/bin/python",
+        "venv/bin/python",
+        "experiments/.venv/Scripts/python.exe",
+        ".venv/Scripts/python.exe",
+        "venv/Scripts/python.exe",
+    ]
+    return {
+        "version": 1,
+        "slug": slug,
+        "title": extract_title(read_text(base / "README.md"), slug),
+        "agents": [],
+        "artifacts": {
+            "task_brief": ["notes/task_brief.md"],
+            "literature_review": ["notes/literature_review.md"],
+            "leader_summary": ["notes/leader_summary.md"],
+            "resource_registry": ["notes/resource_registry.md"],
+            "workflow_store": ["logs/workflow.db"],
+            "interaction_log": ["logs/agent_interactions.md"],
+            "override_log": ["logs/override_log.md"],
+            "run_log": ["logs/run_log.md"],
+            "code": ["experiments/src/solution.py"],
+            "tests": ["experiments/tests/test_solution.py"],
+            "experiments": ["experiments/run_experiment.py", "experiments/analysis.md"],
+            "report": ["report/main.tex"],
+        },
+        "entrypoints": {
+            "python_candidates": python_candidates,
+            "test_commands": ["python -m unittest discover -s tests -v"],
+            "report_commands": ["pdflatex main.tex"],
+            "experiment_cwd": "experiments",
+            "report_cwd": "report",
+        },
+        "workflow": {
+            "primary_code_artifacts": ["experiments/src/solution.py"],
+            "primary_test_artifacts": ["experiments/tests/test_solution.py"],
+            "analysis_artifacts": ["experiments/analysis.md", "experiments/run_experiment.py"],
+            "report_artifacts": ["report/main.tex", "notes/leader_summary.md"],
+        },
+    }
+
+
+def load_task_manifest(base: Path) -> dict[str, Any]:
+    manifest = default_task_manifest(base)
+    path = task_manifest_path(base)
+    if path.exists():
+        try:
+            raw = json.loads(read_text(path))
+        except json.JSONDecodeError:
+            raw = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                manifest[key] = value
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+    manifest["artifacts"] = artifacts
+    entrypoints = manifest.get("entrypoints")
+    if not isinstance(entrypoints, dict):
+        entrypoints = {}
+    manifest["entrypoints"] = entrypoints
+    workflow = manifest.get("workflow")
+    if not isinstance(workflow, dict):
+        workflow = {}
+    manifest["workflow"] = workflow
+    return manifest
+
+
+def manifest_paths(manifest: dict[str, Any], section: str) -> list[str]:
+    artifacts = manifest.get("artifacts", {})
+    values = artifacts.get(section, []) if isinstance(artifacts, dict) else []
+    if isinstance(values, str):
+        return [values]
+    if isinstance(values, list):
+        return [str(value) for value in values if str(value).strip()]
+    return []
+
+
+def workflow_paths(manifest: dict[str, Any], section: str, fallback: list[str]) -> list[str]:
+    workflow = manifest.get("workflow", {})
+    values = workflow.get(section, []) if isinstance(workflow, dict) else []
+    if isinstance(values, str):
+        return [values]
+    if isinstance(values, list) and values:
+        return [str(value) for value in values if str(value).strip()]
+    return fallback
+
+
+def resolve_task_python(base: Path) -> tuple[str, str]:
+    manifest = load_task_manifest(base)
+    entrypoints = manifest.get("entrypoints", {})
+    candidates = entrypoints.get("python_candidates", []) if isinstance(entrypoints, dict) else []
+    if isinstance(candidates, str):
+        candidates = [candidates]
+    normalized: list[str] = []
+    for candidate in candidates:
+        value = str(candidate).strip()
+        if value and value not in normalized:
+            normalized.append(value)
+    if sys.executable not in normalized:
+        normalized.append(sys.executable)
+    for candidate in normalized:
+        path = Path(candidate)
+        resolved = path.resolve() if path.is_absolute() else (base / path).resolve()
+        if resolved.exists() and resolved.is_file():
+            return str(resolved), str(path if not path.is_absolute() else resolved)
+    return sys.executable, sys.executable
+
+
+def manifest_watch_paths(manifest: dict[str, Any]) -> list[str]:
+    relpaths: set[str] = set()
+    for bucket_name in ("artifacts", "workflow"):
+        bucket = manifest.get(bucket_name, {})
+        if not isinstance(bucket, dict):
+            continue
+        for value in bucket.values():
+            if isinstance(value, str):
+                cleaned = value.strip()
+                if cleaned:
+                    relpaths.add(cleaned)
+                continue
+            if isinstance(value, list):
+                for item in value:
+                    cleaned = str(item).strip()
+                    if cleaned:
+                        relpaths.add(cleaned)
+    return sorted(relpaths)
+
+
+def iter_task_watch_paths(base: Path) -> list[Path]:
+    manifest = load_task_manifest(base)
+    relpaths = set(CORE_WATCHED_TASK_PATHS)
+    relpaths.update(manifest_watch_paths(manifest))
+    watched = [base / rel_path for rel_path in sorted(relpaths)]
+    for rel_dir in WATCHED_TASK_DIRS:
+        directory = base / rel_dir
+        if not directory.exists():
+            continue
+        watched.extend(path for path in sorted(directory.rglob("*")) if path.is_file())
+    return watched
+
+
 def task_version(slug: str) -> int:
     base = task_root(slug)
     version = 0
-    for rel_path in WATCHED_TASK_PATHS:
-        path = base / rel_path
+    for path in iter_task_watch_paths(base):
         if path.exists():
             version = max(version, path.stat().st_mtime_ns)
-    figures = base / "report" / "figures"
-    if figures.exists():
-        for path in figures.glob("*"):
-            if path.is_file():
-                version = max(version, path.stat().st_mtime_ns)
-    agent_runs = base / "logs" / "agent_runs"
-    if agent_runs.exists():
-        for path in agent_runs.glob("*"):
-            if path.is_file():
-                version = max(version, path.stat().st_mtime_ns)
     return version
+
+
+def retire_legacy_workflow_state(base: Path) -> list[str]:
+    removed: list[str] = []
+    for rel_path in LEGACY_WORKFLOW_STATE_PATHS:
+        path = base / rel_path
+        if not path.exists():
+            continue
+        path.unlink()
+        removed.append(rel_path)
+    return removed
 
 
 def read_text(path: Path) -> str:
@@ -207,6 +382,32 @@ def append_text(path: Path, value: str) -> None:
 def write_text(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value, encoding="utf-8", newline="\n")
+
+
+def run_status_path(base: Path, run_id: str) -> Path:
+    return base / "logs" / "agent_runs" / f"{run_id}.status.json"
+
+
+def run_job_path(base: Path, run_id: str) -> Path:
+    return base / "logs" / "agent_runs" / f"{run_id}.job.json"
+
+
+def run_proc_log_path(base: Path, run_id: str) -> Path:
+    return base / "logs" / "agent_runs" / f"{run_id}.proc.log"
+
+
+def load_run_status_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(read_text(path))
+    except json.JSONDecodeError:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def write_run_status_file(path: Path, payload: dict[str, Any]) -> None:
+    write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 def indent_block(value: str) -> str:
@@ -291,11 +492,37 @@ def parse_dialogue_entries(markdown: str) -> list[dict[str, str]]:
         lines = chunk.splitlines()
         request_id = strip_markdown(lines[0].strip())
         item: dict[str, str] = {"request_id": request_id, "body": chunk}
-        for line in lines[1:]:
+        idx = 1
+        while idx < len(lines):
+            line = lines[idx]
             match = re.match(r"-\s+([^:]+):\s*(.*)", line)
-            if match:
-                key = match.group(1).strip().lower().replace(" / ", "_").replace(" ", "_")
-                item[key] = strip_markdown(match.group(2).strip())
+            if not match:
+                idx += 1
+                continue
+            key = match.group(1).strip().lower().replace(" / ", "_").replace(" ", "_")
+            value = match.group(2).strip()
+            block_lines: list[str] = []
+            lookahead = idx + 1
+            while lookahead < len(lines):
+                candidate = lines[lookahead]
+                if re.match(r"-\s+[^:]+:\s*", candidate):
+                    break
+                if candidate.startswith("## "):
+                    break
+                if candidate.startswith("  ") or candidate.startswith("\t"):
+                    block_lines.append(candidate.strip())
+                    lookahead += 1
+                    continue
+                if not candidate.strip():
+                    lookahead += 1
+                    continue
+                break
+            if block_lines:
+                merged = "\n".join(block_lines).strip()
+                item[key] = strip_markdown(merged if not value else f"{value}\n{merged}")
+            else:
+                item[key] = strip_markdown(value)
+            idx = lookahead
         entries.append(item)
     return entries
 
@@ -362,6 +589,48 @@ def request_priority_path(base: Path) -> Path:
     return base / "notes" / "request_priorities.json"
 
 
+def task_base_from_request_ref(path: Path) -> Path:
+    if path.name in {"inter_agent_dialogue.md", "agent_interactions.md", "override_log.md"}:
+        return path.parent.parent
+    if path.name == "logs":
+        return path.parent
+    return path
+
+
+def init_workflow_store(base: Path) -> sqlite3.Connection:
+    path = workflow_store_path(base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS requests (
+            request_id TEXT PRIMARY KEY,
+            parent TEXT NOT NULL DEFAULT 'none',
+            status TEXT NOT NULL DEFAULT 'open',
+            from_role TEXT NOT NULL DEFAULT '',
+            to_role TEXT NOT NULL DEFAULT '',
+            type TEXT NOT NULL DEFAULT '',
+            need TEXT NOT NULL DEFAULT '',
+            context TEXT NOT NULL DEFAULT '',
+            artifact_resource TEXT NOT NULL DEFAULT '',
+            leader_review_required TEXT NOT NULL DEFAULT 'yes',
+            why TEXT NOT NULL DEFAULT '',
+            response TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            run_id TEXT NOT NULL DEFAULT '',
+            closed_by TEXT NOT NULL DEFAULT '',
+            priority INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
 def load_request_priorities(base: Path) -> dict[str, int]:
     path = request_priority_path(base)
     if not path.exists():
@@ -402,25 +671,228 @@ def save_request_priorities(base: Path, priorities: dict[str, int]) -> None:
     )
 
 
+REQUEST_STORE_FIELDS = (
+    "request_id",
+    "parent",
+    "status",
+    "from",
+    "to",
+    "type",
+    "need",
+    "context",
+    "artifact_resource",
+    "leader_review_required",
+    "why",
+    "response",
+    "note",
+    "created_at",
+    "updated_at",
+    "run_id",
+    "closed_by",
+    "priority",
+)
+
+
+def normalize_request_record(row: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {field: "" for field in REQUEST_STORE_FIELDS}
+    for key in REQUEST_STORE_FIELDS:
+        value = row.get(key, "")
+        if value is None:
+            value = ""
+        normalized[key] = str(value).strip() if key != "response" else str(value).rstrip()
+    normalized["request_id"] = strip_markdown(normalized["request_id"])
+    normalized["parent"] = strip_markdown(normalized["parent"]) or "none"
+    normalized["status"] = norm_status(normalized["status"]) or "open"
+    normalized["from"] = canonical_role(normalized["from"])
+    normalized["to"] = canonical_role(normalized["to"])
+    normalized["type"] = strip_markdown(normalized["type"])
+    normalized["artifact_resource"] = strip_markdown(normalized["artifact_resource"])
+    normalized["leader_review_required"] = normalized["leader_review_required"] or "yes"
+    try:
+        normalized["priority"] = str(int(normalized.get("priority", "") or 0))
+    except ValueError:
+        normalized["priority"] = "0"
+    return normalized
+
+
+def _request_rows_from_dialogue_markdown(markdown: str) -> list[dict[str, Any]]:
+    rows = parse_table(markdown, "## Request Ledger")
+    entries = parse_dialogue_entries(markdown)
+    by_id: dict[str, dict[str, Any]] = {}
+    ordered_ids: list[str] = []
+    for row in rows:
+        normalized = normalize_request_record(row)
+        request_id = normalized["request_id"]
+        if not request_id:
+            continue
+        by_id[request_id] = normalized
+        ordered_ids.append(request_id)
+    for entry in entries:
+        normalized = normalize_request_record(entry)
+        request_id = normalized["request_id"]
+        if not request_id:
+            continue
+        existing = by_id.get(request_id, {})
+        merged = existing | normalized
+        merged["response"] = existing.get("response", "") or normalized.get("response", "")
+        by_id[request_id] = normalize_request_record(merged)
+        if request_id not in ordered_ids:
+            ordered_ids.append(request_id)
+    return [by_id[request_id] for request_id in ordered_ids if request_id in by_id]
+
+
+def load_legacy_request_rows(base: Path) -> list[dict[str, Any]]:
+    requests: list[dict[str, Any]] = []
+    legacy_json = base / "logs" / "request_ledger.json"
+    if legacy_json.exists():
+        try:
+            raw = json.loads(read_text(legacy_json))
+        except json.JSONDecodeError:
+            raw = {}
+        payload = raw.get("requests", []) if isinstance(raw, dict) else []
+        if isinstance(payload, list):
+            requests = [normalize_request_record(item) for item in payload if isinstance(item, dict)]
+    dialogue_rows = _request_rows_from_dialogue_markdown(read_text(base / "logs" / "inter_agent_dialogue.md"))
+    if not requests:
+        requests = dialogue_rows
+    elif dialogue_rows:
+        by_id = {row["request_id"]: row for row in dialogue_rows}
+        merged_rows: list[dict[str, Any]] = []
+        for row in requests:
+            richer = by_id.get(row["request_id"], {})
+            merged = row | {key: value for key, value in richer.items() if value and not row.get(key)}
+            merged_rows.append(normalize_request_record(merged))
+        requests = merged_rows
+    priorities = load_request_priorities(base)
+    for row in requests:
+        request_id = strip_markdown(row.get("request_id", ""))
+        if request_id in priorities:
+            row["priority"] = str(priorities[request_id])
+    return [row for row in requests if row.get("request_id")]
+
+
+def write_request_rows(conn: sqlite3.Connection, requests: list[dict[str, Any]], *, replace: bool = False) -> None:
+    cleaned = [normalize_request_record(row) for row in requests if row.get("request_id")]
+    cleaned.sort(key=lambda row: (row.get("created_at", ""), row.get("request_id", "")))
+    known_ids = {row["request_id"] for row in cleaned}
+    for row in cleaned:
+        parent = strip_markdown(str(row.get("parent", ""))) or "none"
+        if parent == "none" or parent in known_ids:
+            row["parent"] = parent
+            continue
+        note = str(row.get("note", "")).strip()
+        repair = f"Orphan parent `{parent}` was reset to `none` during ledger validation."
+        row["parent"] = "none"
+        row["note"] = f"{note}\n{repair}".strip() if note else repair
+    if replace:
+        conn.execute("DELETE FROM requests")
+    conn.executemany(
+        """
+        INSERT INTO requests (
+            request_id, parent, status, from_role, to_role, type, need, context,
+            artifact_resource, leader_review_required, why, response, note,
+            created_at, updated_at, run_id, closed_by, priority
+        )
+        VALUES (
+            :request_id, :parent, :status, :from, :to, :type, :need, :context,
+            :artifact_resource, :leader_review_required, :why, :response, :note,
+            :created_at, :updated_at, :run_id, :closed_by, :priority
+        )
+        ON CONFLICT(request_id) DO UPDATE SET
+            parent=excluded.parent,
+            status=excluded.status,
+            from_role=excluded.from_role,
+            to_role=excluded.to_role,
+            type=excluded.type,
+            need=excluded.need,
+            context=excluded.context,
+            artifact_resource=excluded.artifact_resource,
+            leader_review_required=excluded.leader_review_required,
+            why=excluded.why,
+            response=excluded.response,
+            note=excluded.note,
+            created_at=excluded.created_at,
+            updated_at=excluded.updated_at,
+            run_id=excluded.run_id,
+            closed_by=excluded.closed_by,
+            priority=excluded.priority
+        """,
+        cleaned,
+    )
+    conn.commit()
+
+
+def request_row_from_sql(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["priority"] = int(item.get("priority") or 0)
+    return item
+
+
+def load_request_store(base: Path) -> list[dict[str, Any]]:
+    with REQUEST_LOCK:
+        conn = init_workflow_store(base)
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+            if count == 0:
+                legacy_rows = load_legacy_request_rows(base)
+                if legacy_rows:
+                    write_request_rows(conn, legacy_rows, replace=True)
+                    retire_legacy_workflow_state(base)
+            rows = conn.execute(
+                """
+                SELECT request_id, parent, status, from_role AS "from", to_role AS "to",
+                       type, need, context, artifact_resource, leader_review_required,
+                       why, response, note, created_at, updated_at, run_id, closed_by,
+                       priority
+                FROM requests
+                ORDER BY created_at, request_id
+                """
+            ).fetchall()
+            return [request_row_from_sql(row) for row in rows]
+        finally:
+            conn.close()
+
+
+def save_request_store(base: Path, requests: list[dict[str, Any]]) -> None:
+    with REQUEST_LOCK:
+        conn = init_workflow_store(base)
+        try:
+            write_request_rows(conn, requests, replace=True)
+        finally:
+            conn.close()
+
+
 def load_task_state(slug: str) -> dict[str, Any]:
     base = task_root(slug)
     if not base.exists():
         raise FileNotFoundError(slug)
 
-    dialogue = read_text(base / "logs" / "inter_agent_dialogue.md")
     interactions = read_text(base / "logs" / "agent_interactions.md")
     resources_md = read_text(base / "notes" / "resource_registry.md")
     summary = read_text(base / "notes" / "leader_summary.md")
     brief = read_text(base / "notes" / "task_brief.md") or read_text(base / "README.md")
+    manifest = load_task_manifest(base)
 
-    requests = parse_table(dialogue, "## Request Ledger")
-    priorities = load_request_priorities(base)
+    requests = load_request_store(base)
     for index, row in enumerate(requests):
-        request_id = strip_markdown(row.get("request_id", ""))
-        row["priority"] = priorities.get(request_id, 0)
         row["ledger_index"] = index
     resources = parse_table(resources_md, "## Resource Ledger")
-    entries = parse_dialogue_entries(dialogue)
+    entries = [
+        {
+            "request_id": row.get("request_id", ""),
+            "parent": row.get("parent", ""),
+            "from": row.get("from", ""),
+            "to": row.get("to", ""),
+            "type": row.get("type", ""),
+            "status": row.get("status", ""),
+            "need": row.get("need", ""),
+            "context": row.get("context", ""),
+            "why": row.get("why", ""),
+            "response": row.get("response", ""),
+            "artifact_resource": row.get("artifact_resource", ""),
+        }
+        for row in requests
+    ]
     activity = parse_activity_entries(interactions)
     brief_agents = extract_agents_from_md(brief)
     
@@ -468,9 +940,11 @@ def load_task_state(slug: str) -> dict[str, Any]:
         "brief": brief,
         "summary": summary,
         "interactions": interactions,
-        "raw_dialogue": dialogue,
+        "raw_dialogue": "",
         "raw_resources": resources_md,
+        "manifest": manifest,
         "runs": list_task_runs(slug),
+        "max_concurrent": MAX_CONCURRENT_RUNS,
     }
 
 
@@ -478,17 +952,45 @@ def list_task_runs(slug: str) -> list[dict[str, Any]]:
     base = task_root(slug) / "logs" / "agent_runs"
     file_runs: list[dict[str, Any]] = []
     if base.exists():
-        for path in sorted(base.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]:
-            file_runs.append(
-                {
-                    "run_id": path.stem,
-                    "status": "logged",
-                    "provider": "",
-                    "started_at": "",
-                    "finished_at": "",
-                    "log_path": str(path.relative_to(task_root(slug))),
-                }
-            )
+        status_paths = sorted(base.glob("*.status.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if status_paths:
+            for path in status_paths[:20]:
+                payload = load_run_status_file(path)
+                run_id = str(payload.get("run_id") or path.stem.removesuffix(".status"))
+                file_runs.append(
+                    {
+                        "run_id": run_id,
+                        "slug": payload.get("slug", slug),
+                        "status": payload.get("status", "logged"),
+                        "protocol": payload.get("protocol", ""),
+                        "provider": payload.get("protocol", ""),
+                        "role": payload.get("role", ""),
+                        "mode": payload.get("mode", ""),
+                        "request_id": payload.get("request_id", ""),
+                        "started_at": payload.get("started_at", ""),
+                        "finished_at": payload.get("finished_at", ""),
+                        "log_path": payload.get("log_path", str((base / f"{run_id}.log").relative_to(task_root(slug)))),
+                        "progress": payload.get("progress", ""),
+                        "pid": payload.get("pid", 0),
+                    }
+                )
+        else:
+            for path in sorted(base.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]:
+                file_runs.append(
+                    {
+                        "run_id": path.stem,
+                        "slug": slug,
+                        "status": "logged",
+                        "provider": "",
+                        "protocol": "",
+                        "role": "",
+                        "mode": "",
+                        "request_id": "",
+                        "started_at": "",
+                        "finished_at": "",
+                        "log_path": str(path.relative_to(task_root(slug))),
+                    }
+                )
     with RUN_LOCK:
         live_runs = [run.copy() for run in RUNS.values() if run.get("slug") == slug]
     by_id: dict[str, dict[str, Any]] = {run["run_id"]: run for run in file_runs}
@@ -505,17 +1007,15 @@ def update_request_priority_web(slug: str, payload: dict[str, Any]) -> dict[str,
     if not request_id:
         raise ValueError("request_id is required")
 
-    dialogue_path = base / "logs" / "inter_agent_dialogue.md"
-    rows = parse_table(read_text(dialogue_path), "## Request Ledger")
+    rows = load_request_store(base)
     known_ids = {strip_markdown(row.get("request_id", "")) for row in rows}
     if request_id not in known_ids:
         raise ValueError(f"unknown request_id: {request_id}")
 
-    priorities = load_request_priorities(base)
-    current = int(priorities.get(request_id, 0))
+    current = int(next((row.get("priority", 0) for row in rows if row.get("request_id") == request_id), 0) or 0)
     action = str(payload.get("action") or "up").strip().lower()
     if action == "top":
-        new_priority = max([0, *priorities.values()]) + 1
+        new_priority = max([0, *(int(row.get("priority", 0) or 0) for row in rows)]) + 1
     elif action == "up":
         new_priority = current + 1
     elif action == "down":
@@ -531,11 +1031,12 @@ def update_request_priority_web(slug: str, payload: dict[str, Any]) -> dict[str,
         raise ValueError("action must be one of: top, up, down, reset, set")
     new_priority = max(-99, min(999, new_priority))
 
-    if new_priority == 0:
-        priorities.pop(request_id, None)
-    else:
-        priorities[request_id] = new_priority
-    save_request_priorities(base, priorities)
+    for row in rows:
+        if row.get("request_id") == request_id:
+            row["priority"] = new_priority
+            row["updated_at"] = utc_now()
+            break
+    save_request_store(base, rows)
     append_text(
         base / "logs" / "agent_interactions.md",
         (
@@ -549,7 +1050,6 @@ def update_request_priority_web(slug: str, payload: dict[str, Any]) -> dict[str,
         "ok": True,
         "request_id": request_id,
         "priority": new_priority,
-        "priorities": priorities,
     }
 
 
@@ -579,39 +1079,6 @@ def next_request_id() -> str:
     return f"REQ-{timestamp}-{uuid.uuid4().hex[:4]}"
 
 
-def ensure_dialogue_log(path: Path, title: str, slug: str) -> None:
-    if path.exists():
-        return
-    write_text(
-        path,
-        (
-            f"# Inter-Agent Dialogue: {title}\n\n"
-            f"- Slug: `{slug}`\n"
-            f"- Created: `{utc_now()}`\n\n"
-            "## Request Ledger\n\n"
-            "| Request ID | Parent | Status | From | To | Type | Need | Artifact / Resource |\n"
-            "| --- | --- | --- | --- | --- | --- | --- | --- |\n\n"
-            "## Dialogue Entries\n"
-        ),
-    )
-
-
-def add_dialogue_ledger_row(path: Path, row: str) -> None:
-    content = read_text(path)
-    marker = "| --- | --- | --- | --- | --- | --- | --- | --- |"
-    if marker not in content:
-        append_text(path, "\n## Request Ledger Update\n\n" + row)
-        return
-    before, after = content.split(marker, 1)
-    section_marker = "\n## Dialogue Entries"
-    if section_marker in after:
-        ledger_rows, rest = after.split(section_marker, 1)
-        updated_rows = ledger_rows.rstrip() + "\n" + row.rstrip() + "\n\n"
-        write_text(path, before + marker + updated_rows + "## Dialogue Entries" + rest)
-        return
-    write_text(path, before + marker + after.rstrip() + "\n" + row.rstrip() + "\n")
-
-
 def norm_status(status: str) -> str:
     return str(status or "").replace("`", "").strip().lower()
 
@@ -632,6 +1099,15 @@ def active_run_for_request(slug: str, request_id: str) -> dict[str, Any] | None:
                 and run.get("status") in {"queued", "running"}
             ):
                 return run.copy()
+    base = task_root(slug) / "logs" / "agent_runs"
+    if base.exists():
+        for path in sorted(base.glob("*.status.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+            payload = load_run_status_file(path)
+            if (
+                payload.get("request_id") == request_id
+                and payload.get("status") in {"queued", "running"}
+            ):
+                return payload
     return None
 
 
@@ -652,50 +1128,94 @@ def recent_failed_run_for_request(slug: str, request_id: str) -> dict[str, Any] 
             )
         ]
     if not failed:
+        base = task_root(slug) / "logs" / "agent_runs"
+        if base.exists():
+            for path in sorted(base.glob("*.status.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+                payload = load_run_status_file(path)
+                if (
+                    payload.get("request_id") == request_id
+                    and payload.get("status") == "failed"
+                    and isinstance(payload.get("finished_ts"), (int, float))
+                    and now - float(payload.get("finished_ts")) < REQUEST_RETRY_COOLDOWN_SECONDS
+                ):
+                    failed.append(payload)
+    if not failed:
         return None
     return sorted(failed, key=lambda run: float(run.get("finished_ts", 0)), reverse=True)[0]
 
 
-def update_request_status(path: Path, request_id: str, status: str, response_note: str = "") -> bool:
-    """Update one request in the ledger and matching dialogue entry."""
+TERMINAL_REQUEST_STATUSES = {"answered", "accepted", "completed", "skipped", "invalidated", "error"}
 
-    if not request_id or not path.exists():
-        return False
-    content = read_text(path)
-    lines = content.splitlines()
-    changed = False
-    in_entry = False
 
-    for idx, line in enumerate(lines):
-        if line.startswith("|"):
-            cells = line.split("|")
-            if len(cells) >= 9:
-                row_request_id = cells[1].replace("`", "").strip()
-                if row_request_id == request_id:
-                    cells[3] = f" `{status}` "
-                    lines[idx] = "|".join(cells)
-                    changed = True
-        if re.match(r"^(##|###)\s+" + re.escape(request_id) + r"\s*$", line.strip()):
-            in_entry = True
-            continue
-        if in_entry and re.match(r"^(##|###)\s+", line.strip()):
-            in_entry = False
-        if in_entry and line.strip().startswith("- Status:"):
-            lines[idx] = f"- Status: `{status}`"
-            changed = True
+def child_requests_for(rows: list[dict[str, Any]], request_id: str) -> list[dict[str, Any]]:
+    return [
+        row for row in rows
+        if strip_markdown(str(row.get("parent", ""))) == request_id
+    ]
 
-    if changed:
-        updated = "\n".join(lines).rstrip() + "\n"
-        if response_note:
-            updated += (
-                f"\n## State Update - {utc_now()}\n\n"
-                f"- Request ID: `{request_id}`\n"
-                f"- Status: `{status}`\n"
-                "- Note:\n"
-                f"{indent_block(response_note)}\n"
+
+def request_has_pending_children(rows: list[dict[str, Any]], request_id: str) -> bool:
+    children = child_requests_for(rows, request_id)
+    return bool(children) and any(
+        norm_status(str(child.get("status", ""))) not in TERMINAL_REQUEST_STATUSES
+        for child in children
+    )
+
+
+def refresh_blocked_final_reviews(base: Path) -> list[str]:
+    """Reopen blocked final reviews once all corrective child requests finish."""
+    with REQUEST_LOCK:
+        rows = load_request_store(base)
+        reopened: list[str] = []
+        for row in rows:
+            request_id = strip_markdown(str(row.get("request_id", "")))
+            if not request_id:
+                continue
+            if canonical_role(str(row.get("to", ""))) != "leader":
+                continue
+            if str(row.get("type", "")).strip() != "final_review":
+                continue
+            if norm_status(str(row.get("status", ""))) != "blocked":
+                continue
+            children = child_requests_for(rows, request_id)
+            if not children:
+                continue
+            if any(norm_status(str(child.get("status", ""))) not in TERMINAL_REQUEST_STATUSES for child in children):
+                continue
+            row["status"] = "open"
+            row["updated_at"] = utc_now()
+            row["note"] = (
+                "Corrective child requests are complete; final_review is reopened "
+                "for Leader re-evaluation."
             )
-        write_text(path, updated)
-    return changed
+            reopened.append(request_id)
+        if reopened:
+            save_request_store(base, rows)
+        return reopened
+
+
+def update_request_status(path: Path, request_id: str, status: str, response_note: str = "") -> bool:
+    """Update one request in the workflow database."""
+
+    if not request_id:
+        return False
+    base = task_base_from_request_ref(path)
+    with REQUEST_LOCK:
+        rows = load_request_store(base)
+        changed = False
+        for row in rows:
+            if strip_markdown(row.get("request_id", "")) != request_id:
+                continue
+            row["status"] = norm_status(status)
+            row["updated_at"] = utc_now()
+            if response_note:
+                row["note"] = response_note
+                row["response"] = response_note
+            changed = True
+            break
+        if changed:
+            save_request_store(base, rows)
+        return changed
 
 
 def request_exists(
@@ -707,7 +1227,7 @@ def request_exists(
     parent: str | None = None,
     active_only: bool = True,
 ) -> bool:
-    rows = parse_table(read_text(dialogue_path), "## Request Ledger")
+    rows = load_request_store(task_base_from_request_ref(dialogue_path))
     for row in rows:
         if from_role is not None and canonical_role(row.get("from", "")) != canonical_role(from_role):
             continue
@@ -730,7 +1250,7 @@ def direct_request_exists(
     to_role: str,
     active_only: bool = False,
 ) -> bool:
-    rows = parse_table(read_text(dialogue_path), "## Request Ledger")
+    rows = load_request_store(task_base_from_request_ref(dialogue_path))
     for row in rows:
         if canonical_role(row.get("from", "")) != canonical_role(from_role):
             continue
@@ -745,7 +1265,7 @@ def direct_request_exists(
 def find_request_row(dialogue_path: Path, request_id: str) -> dict[str, str]:
     if not request_id:
         return {}
-    rows = parse_table(read_text(dialogue_path), "## Request Ledger")
+    rows = load_request_store(task_base_from_request_ref(dialogue_path))
     for row in rows:
         if strip_markdown(row.get("request_id", "")) == request_id:
             return row
@@ -763,38 +1283,33 @@ def append_workflow_request(
     artifact: str,
     why: str,
     leader_review: str = "yes",
+    context: str = "",
 ) -> str:
     base = task_root(slug)
-    dialogue_path = base / "logs" / "inter_agent_dialogue.md"
-    ensure_dialogue_log(dialogue_path, slug, slug)
     request_id = next_request_id()
     from_role = canonical_role(from_role)
     to_role = canonical_role(to_role)
-    row = (
-        f"| `{request_id}` | `{parent or 'none'}` | `open` | `{from_role}` | `{to_role}` | "
-        f"`{request_type}` | {table_cell(need)} | `{artifact}` |\n"
-    )
-    add_dialogue_ledger_row(dialogue_path, row)
-    append_text(
-        dialogue_path,
-        (
-            f"\n## {request_id}\n\n"
-            f"- Time: `{utc_now()}`\n"
-            f"- Parent: `{parent or 'none'}`\n"
-            f"- From: `{from_role}`\n"
-            f"- To: `{to_role}`\n"
-            f"- Type: `{request_type}`\n"
-            "- Status: `open`\n"
-            f"- Artifact / Resource: `{artifact}`\n"
-            f"- Leader Review Required: {leader_review}\n"
-            "- Need:\n"
-            f"{indent_block(need)}\n"
-            "- Why:\n"
-            f"{indent_block(why)}\n"
-            "- Response:\n"
-            "  - TODO\n"
-        ),
-    )
+    with REQUEST_LOCK:
+        rows = load_request_store(base)
+        rows.append(
+            {
+                "request_id": request_id,
+                "parent": parent or "none",
+                "status": "open",
+                "from": from_role,
+                "to": to_role,
+                "type": request_type,
+                "need": need,
+                "context": context,
+                "artifact_resource": artifact,
+                "leader_review_required": leader_review,
+                "why": why,
+                "response": "TODO",
+                "created_at": utc_now(),
+                "updated_at": utc_now(),
+            }
+        )
+        save_request_store(base, rows)
     return request_id
 
 
@@ -811,7 +1326,7 @@ def append_intervention(slug: str, payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"invalid intervention type: {intervention_type}")
     target = canonical_role(str(payload.get("target", "leader")).strip() or "leader")
     parent = str(payload.get("parent", "none")).strip() or "none"
-    artifact = str(payload.get("artifact", "logs/agent_interactions.md")).strip()
+    artifact = str(payload.get("artifact", "logs/workflow.db")).strip()
     timestamp = utc_now()
 
     append_text(
@@ -827,7 +1342,6 @@ def append_intervention(slug: str, payload: dict[str, Any]) -> dict[str, Any]:
         ),
     )
 
-    request_id = ""
     if intervention_type == "super_admin_override":
         directive = (
             f"\n## Active Override\n\n"
@@ -850,33 +1364,22 @@ def append_intervention(slug: str, payload: dict[str, Any]) -> dict[str, Any]:
                 "- Leader action: pause current direction, mark impacted artifacts, redispatch affected agents.\n"
             ),
         )
-    elif intervention_type != "instruction":
-        request_id = next_request_id()
-        dialogue_log = base / "logs" / "inter_agent_dialogue.md"
-        ensure_dialogue_log(dialogue_log, slug, slug)
-        row = (
-            f"| `{request_id}` | `{parent}` | `open` | `user` | `{target}` | "
-            f"`{intervention_type}` | {table_cell(message)} | `{artifact or 'user intervention'}` |\n"
-        )
-        add_dialogue_ledger_row(dialogue_log, row)
-        append_text(
-            dialogue_log,
-            (
-                f"\n## {request_id}\n\n"
-                f"- Time: `{timestamp}`\n"
-                f"- Parent: `{parent}`\n"
-                "- From: `user`\n"
-                f"- To: `{target}`\n"
-                f"- Type: `{intervention_type}`\n"
-                "- Status: `open`\n"
-                f"- Artifact / Resource: `{artifact or 'user intervention'}`\n"
-                "- Leader Review Required: yes\n"
-                "- Need:\n"
-                f"{indent_block(message)}\n"
-                "- Response:\n"
-                "  - TODO\n"
-            ),
-        )
+
+    request_id = append_workflow_request(
+        slug,
+        parent=parent,
+        from_role="user",
+        to_role=target,
+        request_type=intervention_type,
+        need=message,
+        artifact=artifact or "user intervention",
+        why=(
+            "User submitted a live workflow intervention. The backend structured workflow "
+            "engine owns this request and will advance downstream agent work after execution."
+        ),
+        leader_review="yes",
+        context="Created from the web intervention input; do not hand-edit workflow ledger files.",
+    )
 
     return {"ok": True, "request_id": request_id, "timestamp": timestamp}
 
@@ -1007,7 +1510,7 @@ def create_agent_web(slug: str, payload: dict[str, Any]) -> dict[str, Any]:
                 "- Treat the Leader as the orchestration owner.\n"
                 "- Work only on requests addressed to this role unless the Leader redirects you.\n"
                 "- Save durable outputs to task artifacts when possible.\n"
-                "- Update `logs/inter_agent_dialogue.md` from `open` to `answered` after completing a request.\n"
+                "- Do not edit workflow ledger files directly; the backend state machine updates request status.\n"
             ),
         )
         created_profile = True
@@ -1065,8 +1568,9 @@ def build_runner_prompt(slug: str, user_prompt: str, mode: str, role: str) -> st
     # Task context
     brief = read_text(base / "notes" / "task_brief.md") or read_text(base / "README.md")
     summary = read_text(base / "notes" / "leader_summary.md")
-    dialogue = read_text(base / "logs" / "inter_agent_dialogue.md")
+    workflow_requests = json.dumps(load_request_store(base), ensure_ascii=False, indent=2)
     resources = read_text(base / "notes" / "resource_registry.md")
+    manifest = json.dumps(load_task_manifest(base), ensure_ascii=False, indent=2)
     
     role_profile = ""
     if role:
@@ -1085,19 +1589,18 @@ def build_runner_prompt(slug: str, user_prompt: str, mode: str, role: str) -> st
     dispatch_roles = ", ".join(role for role in available_roles if role != "leader")
     orchestration_rule = (
         "Leader execution rule: do not stop at a summary. When the next step belongs to a "
-        "specialist, append one or more open rows to `logs/inter_agent_dialogue.md` for "
-        f"these available specialist agents: {dispatch_roles}. Each row must include a concrete "
-        "Need, Artifact / Resource, and Status `open`. Also append a short decision record "
-        "to `logs/agent_interactions.md`."
+        f"specialist, state the handoff plan for these available specialist agents: {dispatch_roles}. "
+        "Include concrete Need and Artifact / Resource targets in your output. Do not edit workflow "
+        "ledger files directly; the backend state machine will create structured downstream requests."
         if role == "leader"
         else (
-            "Specialist execution rule: process the assigned Request ID when present. Update "
-            "`logs/inter_agent_dialogue.md` from `open` to `answered`, write any durable work "
-            "to the relevant artifact, and ask another agent for help before guessing through a "
+            "Specialist execution rule: process the assigned Request ID when present. Write durable "
+            "work to the relevant artifact, and ask another agent for help before guessing through a "
             "missing dependency. Literature gaps go to Literature Collector, proof/formula gaps "
             "go to Mathematician, executable evidence gaps go to Code Expert, report-integration "
-            "gaps go to LaTeX Writer, and scheduling/conflict gaps go to Leader. For algorithmic "
-            "work, Code Expert and Mathematician must exchange at least one direct check."
+            "gaps go to LaTeX Writer, and scheduling/conflict gaps go to Leader. Do not edit workflow "
+            "ledger files directly; the backend state machine will mark the current request answered "
+            "and create required follow-up requests."
         )
     )
     mode_rule = (
@@ -1111,11 +1614,17 @@ def build_runner_prompt(slug: str, user_prompt: str, mode: str, role: str) -> st
             "Your file contents go here...\n"
             "```\n\n"
             "If you do not use this exact syntax, your files will NOT be saved to disk. "
-            "You can save multiple files by providing multiple such blocks. Paths must be relative to the task root.\n\n"
+            "You can save multiple files by providing multiple such blocks. Paths must be relative to the task root.\n"
+            "All code, tests, data, experiment outputs, and generated figures/images MUST live under `experiments/`: "
+            "use `experiments/src/` for code, `experiments/tests/` for tests, `experiments/outputs/` for data/results, "
+            "and `experiments/figures/` for plots/images. Do not write new code to top-level `src/`, tests to top-level "
+            "`tests/`, or figures to `report/figures/`.\n\n"
+            "Do not edit protected workflow state files directly. The server-side state machine owns request logs, "
+            "request status transitions, and related protected ledger updates.\n\n"
             "*** LOCAL EXECUTION PERMISSION GRANTED WITH WHITELIST ***\n"
             "After writing files, you may request local verification with explicit command blocks. "
             "Use only this format, one command per line:\n\n"
-            "```command cwd=\".\"\n"
+            "```command cwd=\"experiments\"\n"
             "python3 -m unittest discover -s tests -v\n"
             "```\n\n"
             "Allowed commands include task-local Python scripts, `python3 -m unittest`, `python3 -m pytest`, "
@@ -1137,10 +1646,12 @@ def build_runner_prompt(slug: str, user_prompt: str, mode: str, role: str) -> st
         f"{brief[-4000:]}\n\n"
         "Leader summary:\n"
         f"{summary[-3000:]}\n\n"
-        "Inter-agent dialogue:\n"
-        f"{dialogue[-4000:]}\n\n"
+        "Workflow request state:\n"
+        f"{workflow_requests[-4000:]}\n\n"
         "Resource registry:\n"
         f"{resources[-3000:]}\n\n"
+        "Task manifest:\n"
+        f"{manifest}\n\n"
         "Output requirements:\n"
         "- Be concrete and artifact-oriented.\n"
         "- Mention files that should be changed or inspected.\n"
@@ -1150,7 +1661,8 @@ def build_runner_prompt(slug: str, user_prompt: str, mode: str, role: str) -> st
         "--- IMPORTANT INSTRUCTIONS ---\n"
         f"Mode: {mode}\n"
         f"{mode_rule}\n"
-        "WARNING: The dialogue ledger MUST be written to EXACTLY `logs/inter_agent_dialogue.md` (NOT notes/).\n"
+        "WARNING: Do not write `logs/inter_agent_dialogue.md`, `logs/request_ledger.json`, "
+        "or other workflow ledger files directly.\n"
         "WARNING: The resource registry MUST be written to EXACTLY `notes/resource_registry.md`.\n"
     )
 
@@ -1159,6 +1671,7 @@ def start_agent_run(slug: str, payload: dict[str, Any]) -> dict[str, Any]:
     base = task_root(slug)
     if not base.exists():
         raise FileNotFoundError(slug)
+    refresh_blocked_final_reviews(base)
     protocol = str(payload.get("protocol", "openai")).strip()
     role = canonical_role(str(payload.get("role", "leader")).strip() or "leader")
     mode = str(payload.get("mode", "plan_only")).strip()
@@ -1170,6 +1683,19 @@ def start_agent_run(slug: str, payload: dict[str, Any]) -> dict[str, Any]:
     if protocol != "openai":
         raise ValueError(f"unknown protocol: {protocol}")
     request_id = extract_request_id(user_prompt)
+    if request_id:
+        request_row = find_request_row(base, request_id)
+        rows = load_request_store(base)
+        if (
+            str(request_row.get("type", "")).strip() == "final_review"
+            and canonical_role(str(request_row.get("to", ""))) == "leader"
+            and norm_status(str(request_row.get("status", ""))) == "blocked"
+            and request_has_pending_children(rows, request_id)
+        ):
+            raise ValueError(
+                f"request {request_id} is blocked; wait for its corrective child requests "
+                "to finish before retrying final_review"
+            )
     active_run = active_run_for_request(slug, request_id)
     if active_run is not None:
         raise ValueError(
@@ -1187,6 +1713,7 @@ def start_agent_run(slug: str, payload: dict[str, Any]) -> dict[str, Any]:
     run_dir = base / "logs" / "agent_runs"
     run_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / f"{run_id}.log"
+    status_path = run_status_path(base, run_id)
     run = {
         "run_id": run_id,
         "slug": slug,
@@ -1198,36 +1725,131 @@ def start_agent_run(slug: str, payload: dict[str, Any]) -> dict[str, Any]:
         "started_at": utc_now(),
         "finished_at": "",
         "log_path": str(log_path.relative_to(base)),
+        "status_path": str(status_path.relative_to(base)),
         "progress": "排队中…",
         "progress_ts": 0.0,
+        "pid": 0,
     }
     with RUN_LOCK:
         RUNS[run_id] = run
-
-    # 将 run_id 传入 payload，供 streaming 进度回调使用
-    payload["_run_id"] = run_id
-
-    # 并发限制：超过 MAX_CONCURRENT_RUNS 时等待
-    acquired = _RUN_SEMAPHORE.acquire(blocking=False)
-    if not acquired:
-        run["status"] = "queued"
-        run["progress"] = f"排队等待…（并发上限 {MAX_CONCURRENT_RUNS}，当前已满）"
-        update_run(run_id, status="queued", progress=run["progress"])
-        # 启动线程，线程内部会阻塞等待信号量
-        thread = threading.Thread(
-            target=_run_with_semaphore,
-            args=(run_id, slug, protocol, role, mode, user_prompt, payload, log_path),
-            daemon=True,
-        )
-    else:
-        _RUN_SEMAPHORE.release()  # 释放刚获取的，由 worker 函数管理
-        thread = threading.Thread(
-            target=_run_with_semaphore,
-            args=(run_id, slug, protocol, role, mode, user_prompt, payload, log_path),
-            daemon=True,
-        )
-    thread.start()
+    write_run_status_file(status_path, run)
+    threading.Thread(
+        target=launch_agent_process_with_semaphore,
+        args=(run_id, slug, protocol, role, mode, user_prompt, payload, log_path),
+        daemon=True,
+    ).start()
     return run
+
+
+def launch_agent_process_with_semaphore(
+    run_id: str,
+    slug: str,
+    protocol: str,
+    role: str,
+    mode: str,
+    user_prompt: str,
+    payload: dict[str, Any],
+    log_path: Path,
+) -> None:
+    update_run(run_id, status="queued", progress="排队等待本地子进程槽位…", progress_ts=time.time())
+    _RUN_SEMAPHORE.acquire()
+    try:
+        if is_run_cancelled(run_id):
+            update_run(run_id, status="cancelled", progress="已中断", finished_at=utc_now(), finished_ts=time.time())
+            _RUN_SEMAPHORE.release()
+            return
+        launch_agent_process(run_id, slug, protocol, role, mode, user_prompt, payload, log_path)
+    except Exception as exc:
+        _RUN_SEMAPHORE.release()
+        update_run(run_id, status="failed", finished_at=utc_now(), finished_ts=time.time(), error=str(exc))
+
+
+def launch_agent_process(
+    run_id: str,
+    slug: str,
+    protocol: str,
+    role: str,
+    mode: str,
+    user_prompt: str,
+    payload: dict[str, Any],
+    log_path: Path,
+) -> None:
+    base = task_root(slug)
+    status_path = run_status_path(base, run_id)
+    job_path = run_job_path(base, run_id)
+    proc_log_path = run_proc_log_path(base, run_id)
+    job_payload = {
+        "run_id": run_id,
+        "slug": slug,
+        "protocol": protocol,
+        "role": role,
+        "mode": mode,
+        "prompt": user_prompt,
+        "payload": payload,
+        "log_path": str(log_path),
+        "status_path": str(status_path),
+    }
+    write_text(job_path, json.dumps(job_payload, ensure_ascii=False, indent=2) + "\n")
+    proc_log_path.parent.mkdir(parents=True, exist_ok=True)
+    proc_log = proc_log_path.open("a", encoding="utf-8", newline="\n")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(TOOLS_DIR / "agent_process_worker.py"),
+            "--job",
+            str(job_path),
+        ],
+        cwd=str(ROOT),
+        stdout=proc_log,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    with RUN_PROCESS_LOCK:
+        RUN_PROCESSES[run_id] = process
+    update_run(
+        run_id,
+        status="running",
+        progress="本地子进程已启动",
+        progress_ts=time.time(),
+        pid=process.pid,
+    )
+    threading.Thread(
+        target=watch_agent_process,
+        args=(run_id, process, proc_log, status_path),
+        daemon=True,
+    ).start()
+
+
+def watch_agent_process(
+    run_id: str,
+    process: subprocess.Popen[str],
+    proc_log_handle: Any,
+    status_path: Path,
+) -> None:
+    return_code = process.wait()
+    _RUN_SEMAPHORE.release()
+    try:
+        proc_log_handle.close()
+    except Exception:
+        pass
+    with RUN_PROCESS_LOCK:
+        RUN_PROCESSES.pop(run_id, None)
+    payload = load_run_status_file(status_path)
+    status = str(payload.get("status") or "")
+    updates: dict[str, Any] = {
+        "pid": 0,
+        "finished_ts": time.time(),
+    }
+    if payload:
+        for key in ("status", "progress", "progress_ts", "started_at", "finished_at", "error"):
+            if key in payload:
+                updates[key] = payload[key]
+    if not status or status in {"queued", "running"}:
+        updates["status"] = "finished" if return_code == 0 else "failed"
+        updates["finished_at"] = utc_now()
+        if return_code != 0:
+            updates["error"] = f"agent process exited with code {return_code}"
+    update_run(run_id, **updates)
 
 
 def _run_with_semaphore(
@@ -1244,16 +1866,96 @@ def _run_with_semaphore(
     update_run(run_id, progress="等待执行…", progress_ts=time.time())
     _RUN_SEMAPHORE.acquire()
     try:
+        if is_run_cancelled(run_id):
+            update_run(
+                run_id,
+                status="cancelled",
+                progress="已中断",
+                finished_at=utc_now(),
+                finished_ts=time.time(),
+            )
+            return
         update_run(run_id, progress="正在执行…", progress_ts=time.time())
         run_agent_worker(run_id, slug, protocol, role, mode, user_prompt, payload, log_path)
     finally:
         _RUN_SEMAPHORE.release()
 
 
+def is_run_cancelled(run_id: str) -> bool:
+    with RUN_LOCK:
+        return run_id in CANCELLED_RUNS or RUNS.get(run_id, {}).get("status") == "cancelled"
+
+
+def cancel_runs(slug: str, run_id: str | None = None) -> dict[str, Any]:
+    base = task_root(slug)
+    if not base.exists():
+        raise FileNotFoundError(slug)
+    cancelled: list[str] = []
+    now = utc_now()
+    with RUN_LOCK:
+        for candidate, run in RUNS.items():
+            if run.get("slug") != slug:
+                continue
+            if run_id and candidate != run_id:
+                continue
+            if run.get("status") not in {"queued", "running"}:
+                continue
+            CANCELLED_RUNS.add(candidate)
+            run.update(
+                {
+                    "status": "cancelled",
+                    "progress": "用户已中断",
+                    "finished_at": now,
+                    "finished_ts": time.time(),
+                    "error": "cancelled by user",
+                }
+            )
+            cancelled.append(candidate)
+            log_path_value = run.get("log_path")
+            if log_path_value:
+                log_run(base / str(log_path_value), f"\n## Cancelled\n\n- Time: `{now}`\n- Reason: user interrupt\n")
+            with RUN_PROCESS_LOCK:
+                process = RUN_PROCESSES.get(candidate)
+            if process is not None and process.poll() is None:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+    if cancelled:
+        append_text(
+            base / "logs" / "agent_interactions.md",
+            (
+                f"\n## GUI Event - Runs Interrupted - {now}\n\n"
+                "- From: web_gui\n"
+                "- To: workflow\n"
+                "- Type: interrupt\n"
+                "- Summary:\n"
+                f"{indent_block('Cancelled runs: ' + ', '.join(cancelled))}\n"
+            ),
+        )
+    return {"ok": True, "cancelled": cancelled}
+
+
+def schedule_server_restart() -> dict[str, Any]:
+    def restart_later() -> None:
+        time.sleep(0.35)
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+
+    threading.Thread(target=restart_later, daemon=True).start()
+    return {"ok": True, "message": "server restart scheduled"}
+
+
 def update_run(run_id: str, **values: Any) -> None:
     with RUN_LOCK:
         if run_id in RUNS:
             RUNS[run_id].update(values)
+            run = RUNS[run_id].copy()
+            status_ref = run.get("status_path")
+            if status_ref:
+                path = Path(status_ref)
+                if not path.is_absolute():
+                    path = task_root(str(run.get("slug", ""))) / str(status_ref)
+                write_run_status_file(path, run)
 
 
 def log_run(log_path: Path, text: str) -> None:
@@ -1265,10 +1967,15 @@ def extract_and_write_files(base_path: Path, text: str) -> str:
     pattern = r'```(?:file\s+path|filepath)="([^"]+)"\n(.*?)\n```'
     matches = list(re.finditer(pattern, text, re.DOTALL))
     edited = []
+    remapped = []
     skipped = []
     protected_paths = {
         "logs/inter_agent_dialogue.md",
         "logs/agent_interactions.md",
+        "logs/request_ledger.json",
+        "logs/workflow.db",
+        "logs/workflow_state.json",
+        "logs/dispatch_queue.json",
     }
     for match in matches:
         rel_path = match.group(1).strip()
@@ -1277,16 +1984,24 @@ def extract_and_write_files(base_path: Path, text: str) -> str:
         if normalized_rel in protected_paths:
             skipped.append(rel_path)
             continue
-        safe_path = (base_path / rel_path).resolve()
+        target_rel = normalize_experiment_artifact_path(normalized_rel)
+        if target_rel != normalized_rel:
+            remapped.append((normalized_rel, target_rel))
+        safe_path = (base_path / target_rel).resolve()
         try:
             safe_path.relative_to(base_path.resolve())
             write_text(safe_path, file_content)
-            edited.append(rel_path)
+            edited.append(target_rel)
         except ValueError:
             pass
     notices = []
     if edited:
         notices.append("**System Notice:** 自动写入了以下文件：\n" + "\n".join(f"- `{p}`" for p in edited))
+    if remapped:
+        notices.append(
+            "**System Notice:** 已按任务约定将代码/数据/图像路径归一到 `experiments/`：\n"
+            + "\n".join(f"- `{src}` → `{dst}`" for src, dst in remapped)
+        )
     if skipped:
         notices.append(
             "**System Notice:** 跳过了受保护的工作流台账文件，状态机将负责更新：\n"
@@ -1297,9 +2012,50 @@ def extract_and_write_files(base_path: Path, text: str) -> str:
     return text
 
 
+def normalize_experiment_artifact_path(rel_path: str) -> str:
+    normalized = Path(rel_path).as_posix().lstrip("/")
+    parts = normalized.split("/")
+    if not parts:
+        return normalized
+    if parts[0] == "src":
+        return Path("experiments", "src", *parts[1:]).as_posix()
+    if parts[0] == "tests":
+        return Path("experiments", "tests", *parts[1:]).as_posix()
+    if parts[0] == "figures":
+        return Path("experiments", "figures", *parts[1:]).as_posix()
+    if parts[0] in {"outputs", "data", "datasets"}:
+        return Path("experiments", *parts).as_posix()
+    if len(parts) >= 2 and parts[0] == "report" and parts[1] == "figures":
+        return Path("experiments", "figures", *parts[2:]).as_posix()
+    if len(parts) == 1:
+        suffix = Path(parts[0]).suffix.lower()
+        if suffix == ".py":
+            return Path("experiments", parts[0]).as_posix()
+        if suffix in {".csv", ".json", ".jsonl", ".npy", ".npz", ".parquet", ".pkl", ".txt"}:
+            return Path("experiments", "outputs", parts[0]).as_posix()
+        if suffix in {".png", ".jpg", ".jpeg", ".svg", ".pdf", ".webp", ".gif"}:
+            return Path("experiments", "figures", parts[0]).as_posix()
+    return normalized
+
+
 def _resolve_task_path(base_path: Path, cwd: str) -> Path:
-    target = (base_path / (cwd or ".")).resolve()
-    target.relative_to(base_path.resolve())
+    raw = (cwd or ".").strip()
+    rel = Path(raw)
+    base_resolved = base_path.resolve()
+    parts = rel.parts
+    if raw in {"", "."}:
+        target = base_resolved
+    elif rel.is_absolute():
+        target = rel.resolve()
+    elif len(parts) >= 2 and parts[0] == "tasks" and parts[1] == base_path.name:
+        # Agents often write project-root-relative cwd="tasks/<slug>" even
+        # though command blocks already execute relative to the task root.
+        target = (ROOT / rel).resolve()
+    else:
+        target = (base_path / rel).resolve()
+    target.relative_to(base_resolved)
+    if not target.exists() or not target.is_dir():
+        raise ValueError(f"cwd does not exist inside task: {cwd}")
     return target
 
 
@@ -1351,20 +2107,35 @@ def validate_local_command(base_path: Path, cwd: Path, args: list[str]) -> str |
     return f"command is not allowed: {args[0]}"
 
 
-def execute_local_command_blocks(base_path: Path, text: str) -> str:
+def is_python_executable_name(value: str) -> bool:
+    lowered = Path(value).name.lower()
+    return bool(re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", lowered))
+
+
+def execute_local_command_blocks(base_path: Path, text: str) -> tuple[str, list[dict[str, Any]]]:
     pattern = r'```(?:command|cmd)(?:\s+cwd="([^"]*)")?\n(.*?)\n```'
     blocks = list(re.finditer(pattern, text, re.DOTALL))
     if not blocks:
-        return text
+        return text, []
 
     notices: list[str] = []
+    results: list[dict[str, Any]] = []
     command_count = 0
+    resolved_python, python_label = resolve_task_python(base_path)
     for block in blocks[:MAX_LOCAL_COMMANDS_PER_RUN]:
         cwd_raw = block.group(1) or "."
         try:
             cwd = _resolve_task_path(base_path, cwd_raw)
         except ValueError:
             notices.append(f"### Rejected command block\n\n- cwd outside task: `{cwd_raw}`")
+            results.append(
+                {
+                    "status": "rejected",
+                    "cwd": cwd_raw,
+                    "command": "",
+                    "reason": f"cwd outside task: {cwd_raw}",
+                }
+            )
             continue
 
         for raw_line in block.group(2).splitlines():
@@ -1379,11 +2150,15 @@ def execute_local_command_blocks(base_path: Path, text: str) -> str:
                 args = shlex.split(command)
             except ValueError as exc:
                 notices.append(f"### Rejected command\n\n- command: `{command}`\n- reason: {exc}")
+                results.append({"status": "rejected", "cwd": str(cwd), "command": command, "reason": str(exc)})
                 continue
             reason = validate_local_command(base_path, cwd, args)
             if reason:
                 notices.append(f"### Rejected command\n\n- command: `{command}`\n- reason: {reason}")
+                results.append({"status": "rejected", "cwd": str(cwd), "command": command, "reason": reason})
                 continue
+            if is_python_executable_name(args[0]):
+                args[0] = resolved_python
             started = utc_now()
             try:
                 completed = subprocess.run(
@@ -1396,6 +2171,19 @@ def execute_local_command_blocks(base_path: Path, text: str) -> str:
                 )
                 stdout = (completed.stdout or "")[-LOCAL_COMMAND_OUTPUT_LIMIT:]
                 stderr = (completed.stderr or "")[-LOCAL_COMMAND_OUTPUT_LIMIT:]
+                results.append(
+                    {
+                        "status": "completed",
+                        "started_at": started,
+                        "cwd": str(cwd.relative_to(base_path.resolve()) or "."),
+                        "command": command,
+                        "argv": args,
+                        "python": python_label if is_python_executable_name(command.split()[0]) else "",
+                        "exit_code": completed.returncode,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                    }
+                )
                 notices.append(
                     "\n".join(
                         [
@@ -1404,6 +2192,7 @@ def execute_local_command_blocks(base_path: Path, text: str) -> str:
                             f"- started: `{started}`",
                             f"- cwd: `{cwd.relative_to(base_path.resolve()) or '.'}`",
                             f"- command: `{command}`",
+                            f"- python: `{python_label}`" if is_python_executable_name(command.split()[0]) else "- python: `(n/a)`",
                             f"- exit_code: `{completed.returncode}`",
                             "",
                             "stdout:",
@@ -1424,6 +2213,7 @@ def execute_local_command_blocks(base_path: Path, text: str) -> str:
                         [
                             "### Local Command Timeout",
                             "",
+                            f"- started: `{started}`",
                             f"- command: `{command}`",
                             f"- timeout_seconds: `{LOCAL_COMMAND_TIMEOUT_SECONDS}`",
                             "",
@@ -1439,9 +2229,22 @@ def execute_local_command_blocks(base_path: Path, text: str) -> str:
                         ]
                     )
                 )
+                results.append(
+                    {
+                        "status": "timeout",
+                        "started_at": started,
+                        "cwd": str(cwd.relative_to(base_path.resolve()) or "."),
+                        "command": command,
+                        "argv": args,
+                        "python": python_label if is_python_executable_name(command.split()[0]) else "",
+                        "exit_code": -1,
+                        "stdout": (exc.stdout or "")[-LOCAL_COMMAND_OUTPUT_LIMIT:] if isinstance(exc.stdout, str) else "",
+                        "stderr": (exc.stderr or "")[-LOCAL_COMMAND_OUTPUT_LIMIT:] if isinstance(exc.stderr, str) else "",
+                    }
+                )
     if notices:
-        return text + "\n\n## Local Execution Results\n\n" + "\n\n".join(notices)
-    return text
+        return text + "\n\n## Local Execution Results\n\n" + "\n\n".join(notices), results
+    return text, results
 
 
 def auto_feedback_to_leader(slug: str, role: str, prompt: str) -> None:
@@ -1451,13 +2254,65 @@ def auto_feedback_to_leader(slug: str, role: str, prompt: str) -> None:
         return
 
     base = task_root(slug)
-    dialogue_path = base / "logs" / "inter_agent_dialogue.md"
     update_request_status(
-        dialogue_path,
+        base,
         request_id,
         "answered",
         f"{role} completed the assigned runner task.",
     )
+
+
+def consolidate_redundant_requests(dialogue_path: Path) -> None:
+    """Only merge exact duplicate requests within the same parent context."""
+    base = task_base_from_request_ref(dialogue_path)
+    if not base.exists():
+        return
+    rows = load_request_store(base)
+    active_rows = [
+        row for row in rows
+        if norm_status(row.get("status", "")) in {"open", "queued", "running"}
+    ]
+    seen: dict[tuple[str, str, str, str, str, str], str] = {}
+    to_close: list[tuple[str, str]] = []
+    for row in active_rows:
+        parent = strip_markdown(row.get("parent", "")) or "none"
+        req_type = str(row.get("type", "")).strip()
+        to_role = canonical_role(row.get("to", ""))
+
+        key = (
+            parent,
+            canonical_role(row.get("from", "")),
+            to_role,
+            req_type,
+            str(row.get("artifact_resource", "")).strip(),
+            " ".join(str(row.get("need", "")).split()),
+        )
+        current_id = strip_markdown(row.get("request_id", ""))
+        if not current_id:
+            continue
+        earlier_id = seen.get(key)
+        if earlier_id:
+            to_close.append(
+                (
+                    current_id,
+                    f"Closed by Leader consolidation: merged with exact duplicate request `{earlier_id}`.",
+                )
+            )
+            continue
+        seen[key] = current_id
+    for req_id, reason in to_close:
+        update_request_status(dialogue_path, req_id, "skipped", reason)
+
+
+def consolidate_all_tasks() -> None:
+    """Consolidate requests for all existing tasks in the workspace."""
+    root = ROOT / "tasks"
+    if not root.exists():
+        return
+    for path in root.iterdir():
+        if not path.is_dir():
+            continue
+        consolidate_redundant_requests(path)
 
 
 def advance_workflow_state(
@@ -1467,35 +2322,99 @@ def advance_workflow_state(
     prompt: str,
     run_id: str,
     output_artifact: str,
+    agent_output: str = "",
+    local_command_results: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """Deterministically move the task to the next agent requests."""
 
     role = canonical_role(role)
     base = task_root(slug)
-    dialogue_path = base / "logs" / "inter_agent_dialogue.md"
-    ensure_dialogue_log(dialogue_path, slug, slug)
+    dialogue_path = base
+
+    consolidate_redundant_requests(dialogue_path)
 
     current_request_id = extract_request_id(prompt)
     current_request = find_request_row(dialogue_path, current_request_id) if current_request_id else {}
     current_from = canonical_role(current_request.get("from", ""))
+    current_type = current_request.get("type", "")
+    manifest = load_task_manifest(base)
+    literature_artifacts = "; ".join(manifest_paths(manifest, "literature_review") or ["notes/literature_review.md", "report/references.bib"])
+    math_artifacts = "; ".join(workflow_paths(manifest, "math_artifacts", ["notes/math_model.md", "notes/open_questions.md"]))
+    code_artifacts = "; ".join(workflow_paths(manifest, "primary_code_artifacts", manifest_paths(manifest, "code") or ["experiments/src/solution.py"]))
+    test_artifacts = "; ".join(workflow_paths(manifest, "primary_test_artifacts", manifest_paths(manifest, "tests") or ["experiments/tests/test_solution.py"]))
+    experiment_artifacts = "; ".join(
+        workflow_paths(
+            manifest,
+            "analysis_artifacts",
+            manifest_paths(manifest, "experiments") or ["experiments/run_experiment.py", "experiments/analysis.md"],
+        )
+    )
+    report_artifacts = "; ".join(workflow_paths(manifest, "report_artifacts", manifest_paths(manifest, "report") or ["report/main.tex", "notes/leader_summary.md"]))
+
+    status_to_set = "answered"
+    final_review_gate_reason = ""
+    if role == "leader" and current_type == "final_review":
+        command_results = list(local_command_results or [])
+        verification_failures = [
+            item for item in command_results
+            if item.get("status") != "completed" or int(item.get("exit_code", 1)) != 0
+        ]
+        other_open = [
+            row for row in load_request_store(base)
+            if strip_markdown(row.get("request_id", "")) != current_request_id
+            and norm_status(row.get("status", "")) in {"open", "queued", "running", "blocked"}
+        ]
+        
+        # Check if the leader explicitly accepted the task in its output.
+        # Avoid treating generic words like "completed" as acceptance because
+        # phrases such as "not completed" previously closed final reviews.
+        lowered_output = agent_output.lower()
+        leader_accepted = any(
+            kw in lowered_output
+            for kw in ["accepted", "acceptance granted", "验收通过", "满足验收标准", "可以交付"]
+        )
+        
+        if verification_failures:
+            final_review_gate_reason = "local verification commands reported non-zero exit status or timeout"
+            status_to_set = "blocked"
+        elif other_open and not leader_accepted:
+            final_review_gate_reason = f"other requests remain open or blocked ({len(other_open)} items)"
+            status_to_set = "blocked"
+        elif leader_accepted:
+            status_to_set = "accepted"
+        else:
+            # If no commands run and no acceptance, we don't strictly block it anymore, just mark as answered
+            status_to_set = "answered"
+
     if current_request_id:
+        base_reason = (
+            f"{role} completed `{run_id}` and wrote `{output_artifact}`."
+            if not final_review_gate_reason
+            else f"{role} completed `{run_id}` but final review is blocked: {final_review_gate_reason}."
+        )
+        if agent_output:
+            agent_context_short = (agent_output[:2000] + "..." if len(agent_output) > 2000 else agent_output).strip()
+            base_reason += f"\n\nContext:\n{agent_context_short}"
         update_request_status(
             dialogue_path,
             current_request_id,
-            "answered",
-            f"{role} completed `{run_id}` and wrote `{output_artifact}`.",
+            status_to_set,
+            base_reason,
         )
 
     parent = current_request_id or run_id
     created: list[str] = []
 
+    agent_context = (agent_output[:2000] + "..." if len(agent_output) > 2000 else agent_output).strip() if agent_output else ""
+
     def create_once(to_role: str, request_type: str, need: str, artifact: str, why: str) -> None:
+        dedupe_parent = parent if role == "leader" else None
         if request_exists(
             dialogue_path,
             from_role=role,
             to_role=to_role,
             request_type=request_type,
-            parent=parent,
+            parent=dedupe_parent,
             active_only=False,
         ):
             return
@@ -1508,55 +2427,83 @@ def advance_workflow_state(
             need=need,
             artifact=artifact,
             why=why,
+            context=agent_context,
         )
         created.append(request_id)
 
     if role == "leader":
-        create_once(
-            "literature_collector",
-            "literature_request",
-            (
-                "Map the research landscape for the task: representative papers, mainstream routes, "
-                "baselines, datasets, metrics, source boundaries, and recommended direction."
-            ),
-            "notes/literature_review.md; report/references.bib",
-            "The workflow requires literature grounding before math, implementation, and report claims are finalized.",
-        )
-        create_once(
-            "mathematician",
-            "theory_check",
-            (
-                "Start formal grounding directly from the user brief and current task state: define variables, "
-                "assumptions, claim boundaries, expected formula behavior, and edge cases. Ask Literature Collector "
-                "for source support when assumptions need citations, and ask Code Expert for executable checks when "
-                "a formula or invariant should be validated numerically."
-            ),
-            "notes/math_model.md; notes/open_questions.md",
-            "Leader must give Mathematician direct ownership of the mathematical basis instead of routing all theory through literature.",
-        )
-        create_once(
-            "code_expert",
-            "implementation_check",
-            (
-                "Start the runnable implementation and validation plan directly from the user brief and current task state: "
-                "identify code paths, tests, experiment commands, metrics, and expected artifacts. Ask Mathematician for "
-                "formal assumptions before hard-coding algorithm claims, and ask Literature Collector for missing baseline "
-                "or dataset protocol evidence."
-            ),
-            "src/solution.py; tests/test_solution.py; experiments/run_experiment.py; experiments/analysis.md",
-            "Leader must give Code Expert direct ownership of executable evidence instead of waiting for collector relay.",
-        )
+        if current_type == "final_review" and status_to_set == "blocked":
+            failed_commands = list(local_command_results or [])
+            test_failed = any(
+                Path(str(item.get("argv", [""])[0])).name.lower().startswith("python")
+                or str(item.get("command", "")).startswith("pytest")
+                or "pytest" in str(item.get("command", ""))
+                or "unittest" in str(item.get("command", ""))
+                for item in failed_commands
+                if item.get("status") != "completed" or int(item.get("exit_code", 1)) != 0
+            )
+            report_failed = any(
+                Path(str(item.get("argv", [""])[0])).name.lower() in {"pdflatex", "xelatex", "lualatex", "bibtex"}
+                for item in failed_commands
+                if item.get("status") != "completed" or int(item.get("exit_code", 1)) != 0
+            )
+            if test_failed:
+                create_once(
+                    "code_expert",
+                    "implementation_check",
+                    (
+                        "Fix failing executable tests/experiments."
+                    ),
+                    "; ".join(filter(None, [code_artifacts, test_artifacts, experiment_artifacts])),
+                    "Leader final_review is blocked until local executable verification succeeds with zero exit codes.",
+                )
+            if report_failed:
+                create_once(
+                    "latex_writer",
+                    "writing_gap",
+                    (
+                        "Fix failing report compilation."
+                    ),
+                    report_artifacts,
+                    "Leader final_review is blocked until report compilation succeeds with zero exit codes.",
+                )
+        elif status_to_set != "accepted":
+            create_once(
+                "literature_collector",
+                "literature_request",
+                (
+                    "Map the research landscape, baselines, and boundaries."
+                ),
+                literature_artifacts,
+                "The workflow requires literature grounding before math, implementation, and report claims are finalized.",
+            )
+            create_once(
+                "mathematician",
+                "theory_check",
+                (
+                    "Define math variables, assumptions, and edge cases."
+                ),
+                math_artifacts,
+                "Leader must give Mathematician direct ownership of the mathematical basis instead of routing all theory through literature.",
+            )
+            create_once(
+                "code_expert",
+                "implementation_check",
+                (
+                    "Implement validation plan, check logic paths and edge cases."
+                ),
+                "; ".join(filter(None, [code_artifacts, test_artifacts, experiment_artifacts, "experiments/outputs/", "experiments/figures/"])),
+                "Leader must give Code Expert direct ownership of executable evidence instead of waiting for collector relay.",
+            )
     elif role == "literature_collector":
         if current_from == "code_expert":
             create_once(
                 "code_expert",
                 "baseline_request",
                 (
-                    "Use the returned literature baseline, dataset, metric, and source-boundary information "
-                    "to revise the implementation or experiment plan. If any mathematical assumption is still "
-                    "unclear, request a theory_check from Mathematician before reporting results."
+                    "Revise plan using literature baselines and metrics."
                 ),
-                "notes/algorithm_survey.md; experiments/analysis.md",
+                experiment_artifacts or "experiments/analysis.md",
                 "Code Expert requested literature support and should continue from the sourced baseline map.",
             )
         elif current_from == "latex_writer":
@@ -1564,10 +2511,9 @@ def advance_workflow_state(
                 "latex_writer",
                 "source_check",
                 (
-                    "Integrate the returned citations, source boundaries, and BibTeX entries into the report; "
-                    "mark unsupported claims instead of filling them from memory."
+                    "Integrate citations and mark unsupported claims."
                 ),
-                "report/main.tex; report/references.bib",
+                report_artifacts,
                 "LaTeX Writer requested source support and needs a source-grounded writing pass.",
             )
         else:
@@ -1575,30 +2521,27 @@ def advance_workflow_state(
                 "mathematician",
                 "theory_check",
                 (
-                    "Convert the literature-backed task direction into formal definitions, assumptions, "
-                    "claim boundaries, proof obligations, and edge cases."
+                    "Convert direction into formal definitions and proof boundaries."
                 ),
-                "notes/math_model.md; notes/open_questions.md",
+                math_artifacts,
                 "The implementation and report need explicit assumptions and non-overclaiming boundaries.",
             )
             create_once(
                 "code_expert",
                 "baseline_request",
                 (
-                    "Design the implementation and experiment plan from the literature map: baselines, "
-                    "metrics, reproducible commands, test coverage, and expected artifacts."
+                    "Design reproducible experiment plan from literature map."
                 ),
-                "src/solution.py; tests/test_solution.py; experiments/run_experiment.py; experiments/analysis.md",
+                "; ".join(filter(None, [code_artifacts, test_artifacts, experiment_artifacts, "experiments/outputs/", "experiments/figures/"])),
                 "The workflow must move from research map to runnable validation instead of stopping at literature review.",
             )
             create_once(
                 "latex_writer",
                 "source_check",
                 (
-                    "Prepare report source boundaries, related-work structure, citation expectations, and "
-                    "unsupported-claim markers from the literature map."
+                    "Prepare source boundaries and related-work structure."
                 ),
-                "report/main.tex; report/references.bib",
+                report_artifacts,
                 "The report should receive source boundaries before final writing.",
             )
     elif role == "mathematician":
@@ -1607,10 +2550,9 @@ def advance_workflow_state(
                 "latex_writer",
                 "theory_check",
                 (
-                    "Integrate the returned definitions, theorem/proof boundaries, notation, and unsupported "
-                    "mathematical claims into the report."
+                    "Integrate formal mathematical definitions into report."
                 ),
-                "report/main.tex",
+                report_artifacts,
                 "LaTeX Writer requested mathematical support and needs checked wording.",
             )
         else:
@@ -1624,20 +2566,18 @@ def advance_workflow_state(
                     "literature_collector",
                     "source_check",
                     (
-                        "Check whether the mathematical assumptions, theorem conditions, and claim boundaries "
-                        "are supported by the literature map; return source-backed caveats or missing references."
+                        "Check if math assumptions are supported by literature."
                     ),
-                    "notes/literature_review.md; notes/math_model.md",
+                    "; ".join(filter(None, [literature_artifacts, math_artifacts])),
                     "Mathematical assumptions should be grounded in source evidence when the report cites them.",
                 )
             create_once(
                 "code_expert",
                 "implementation_check",
                 (
-                    "Implement or revise the algorithm using the mathematical assumptions and edge cases; "
-                    "add tests that cover the stated proof obligations, expected formula outputs, and failure modes."
+                    "Implement algorithm and edge cases with tests."
                 ),
-                "src/solution.py; tests/test_solution.py",
+                "; ".join(filter(None, [code_artifacts, test_artifacts])),
                 "The math output must be turned into executable, testable behavior.",
             )
     elif role == "code_expert":
@@ -1651,10 +2591,9 @@ def advance_workflow_state(
                 "literature_collector",
                 "baseline_request",
                 (
-                    "Provide missing or confirmatory baseline, dataset, metric, source, and reproduction-protocol "
-                    "details needed by the implementation and experiments. Mark unavailable evidence explicitly."
+                    "Provide dataset and reproduction details."
                 ),
-                "notes/algorithm_survey.md; experiments/analysis.md",
+                experiment_artifacts or "experiments/analysis.md",
                 "Code Expert should ask Literature Collector for missing literature or benchmark support before guessing.",
             )
         has_math_validation = request_exists(
@@ -1669,11 +2608,9 @@ def advance_workflow_state(
                 "mathematician",
                 "theory_check",
                 (
-                    "Validate the implemented algorithm against the formal assumptions: identify required invariants, "
-                    "derive expected outputs for edge cases or synthetic checks, and flag any claim that the code or "
-                    "experiment does not mathematically justify."
+                    "Validate algorithm mathematically against edge cases."
                 ),
-                "notes/math_model.md; tests/test_solution.py; experiments/analysis.md",
+                "; ".join(filter(None, [math_artifacts, test_artifacts, experiment_artifacts])),
                 "Algorithm design must be checked against rigorous mathematical assumptions before report integration.",
             )
         else:
@@ -1681,10 +2618,9 @@ def advance_workflow_state(
                 "latex_writer",
                 "evidence_request",
                 (
-                    "Integrate the mathematically checked implementation, tests, experiment commands, result files, "
-                    "and limitations into the report without unsupported claims."
+                    "Integrate validated code, experiments, and limitations into the report."
                 ),
-                "report/main.tex; notes/leader_summary.md",
+                report_artifacts,
                 "The report should only use claims backed by code, tests, experiments, proof, or sources.",
             )
     elif role == "latex_writer":
@@ -1699,10 +2635,9 @@ def advance_workflow_state(
                 "literature_collector",
                 "source_check",
                 (
-                    "Provide citation support, BibTeX, source boundaries, and related-work wording for all report claims. "
-                    "Flag claims that lack source support."
+                    "Provide citation support for all report claims."
                 ),
-                "report/main.tex; report/references.bib",
+                report_artifacts,
                 "The report cannot finalize source-backed claims without Literature Collector support.",
             )
             requested_support = True
@@ -1716,10 +2651,9 @@ def advance_workflow_state(
                 "mathematician",
                 "theory_check",
                 (
-                    "Provide checked definitions, theorem statements, formula derivations, proof boundaries, and "
-                    "unsupported mathematical-claim markers for the report."
+                    "Provide checked mathematical definitions, theorems, and proof boundaries."
                 ),
-                "report/main.tex; notes/math_model.md",
+                "; ".join(filter(None, [report_artifacts, math_artifacts])),
                 "The report cannot finalize mathematical claims without Mathematician support.",
             )
             requested_support = True
@@ -1733,10 +2667,9 @@ def advance_workflow_state(
                 "code_expert",
                 "evidence_request",
                 (
-                    "Provide experiment commands, result files, tables, figures, implementation paths, and limitations "
-                    "for report integration."
+                    "Provide reproducible experiment commands and figures."
                 ),
-                "report/main.tex; experiments/analysis.md; report/figures/",
+                "; ".join(filter(None, [report_artifacts, experiment_artifacts, "experiments/outputs/", "experiments/figures/"])),
                 "The report cannot finalize implementation or experiment claims without Code Expert support.",
             )
             requested_support = True
@@ -1745,12 +2678,54 @@ def advance_workflow_state(
                 "leader",
                 "final_review",
                 (
-                    "Review all open or blocked requests, check consistency across literature, math, code, "
-                    "experiments, and report, then decide whether the task is accepted or needs rework."
+                    "Final Review: Check cross-artifact consistency and accept or request rework."
                 ),
-                "notes/leader_summary.md; logs/inter_agent_dialogue.md; report/main.tex",
+                "; ".join(filter(None, [report_artifacts, "logs/workflow.db"])),
                 "Final delivery needs Leader arbitration and explicit residual-risk handling.",
             )
+
+    reopened = refresh_blocked_final_reviews(base)
+    if reopened:
+        append_text(
+            base / "logs" / "agent_interactions.md",
+            (
+                f"\n## Workflow State Advance - {utc_now()}\n\n"
+                f"- From: state_machine\n"
+                f"- To: workflow\n"
+                f"- Topic: reopen:final_review\n"
+                f"- Artifact: logs/workflow.db\n"
+                "- Summary:\n"
+                f"{indent_block('Reopened final_review requests: ' + ', '.join(reopened))}\n"
+            ),
+        )
+
+    if role == "leader" and status_to_set == "accepted":
+        if not request_exists(
+            dialogue_path,
+            from_role="leader",
+            to_role="leader",
+            request_type="leader_decision",
+            parent=current_request_id or None,
+            active_only=False,
+        ):
+            decision_id = append_workflow_request(
+                slug,
+                parent=current_request_id or "none",
+                from_role="leader",
+                to_role="leader",
+                request_type="leader_decision",
+                need="Task accepted by Leader final_review.",
+                artifact="logs/workflow.db",
+                why="Record the explicit final arbitration required by the inter-agent dialogue protocol.",
+                context=agent_context,
+            )
+            update_request_status(
+                dialogue_path,
+                decision_id,
+                "answered",
+                f"Leader accepted `{current_request_id or run_id}` in `{run_id}`.",
+            )
+            created.append(decision_id)
 
     if created:
         append_text(
@@ -1760,9 +2735,22 @@ def advance_workflow_state(
                 f"- From: state_machine\n"
                 f"- To: workflow\n"
                 f"- Topic: advance:{role}\n"
-                f"- Artifact: logs/inter_agent_dialogue.md\n"
+                f"- Artifact: logs/workflow.db\n"
                 "- Summary:\n"
                 f"{indent_block('Created requests: ' + ', '.join(created))}\n"
+            ),
+        )
+    elif role == "leader" and status_to_set == "accepted":
+        append_text(
+            base / "logs" / "agent_interactions.md",
+            (
+                f"\n## Workflow State Advance - {utc_now()}\n\n"
+                f"- From: state_machine\n"
+                f"- To: workflow\n"
+                f"- Topic: advance:{role}\n"
+                f"- Artifact: logs/workflow.db\n"
+                "- Summary:\n"
+                f"{indent_block('Workflow successfully completed and accepted by Leader.')}\n"
             ),
         )
     return created
@@ -1808,9 +2796,14 @@ def run_agent_worker(
     )
     try:
         result = run_openai_compatible(slug, protocol, role, mode, user_prompt, payload)
+        if is_run_cancelled(run_id):
+            raise RunCancelled("cancelled by user")
+        local_command_results: list[dict[str, Any]] = []
         if mode == "execute":
             result = extract_and_write_files(base, result)
-            result = execute_local_command_blocks(base, result)
+            if is_run_cancelled(run_id):
+                raise RunCancelled("cancelled by user")
+            result, local_command_results = execute_local_command_blocks(base, result)
 	            
         log_run(log_path, "\n## Result\n\n" + result + "\n")
         plan_path = base / "notes" / f"runner_{run_id}.md"
@@ -1823,6 +2816,8 @@ def run_agent_worker(
                 prompt=user_prompt,
                 run_id=run_id,
                 output_artifact=str(plan_path.relative_to(base)),
+                agent_output=result,
+                local_command_results=local_command_results,
             )
             if created_requests:
                 log_run(
@@ -1845,6 +2840,22 @@ def run_agent_worker(
             ),
         )
         update_run(run_id, status="finished", finished_at=utc_now(), finished_ts=time.time())
+    except RunCancelled as exc:
+        message = str(exc) or "cancelled by user"
+        log_run(log_path, "\n## Cancelled\n\n" + message + "\n")
+        append_text(
+            base / "logs" / "agent_interactions.md",
+            (
+                f"\n## Agent Run Cancelled - {utc_now()}\n\n"
+                "- From: web_runner\n"
+                "- To: leader\n"
+                f"- Topic: {protocol}:{mode}:cancelled\n"
+                f"- Artifact: logs/agent_runs/{run_id}.log\n"
+                "- Summary:\n"
+                f"  {message}\n"
+            ),
+        )
+        update_run(run_id, status="cancelled", finished_at=utc_now(), finished_ts=time.time(), error=message)
     except Exception as exc:  # pragma: no cover - thread boundary
         message = f"{type(exc).__name__}: {exc}"
         log_run(log_path, "\n## Error\n\n" + message + "\n")
@@ -1861,6 +2872,52 @@ def run_agent_worker(
             ),
         )
         update_run(run_id, status="failed", finished_at=utc_now(), finished_ts=time.time(), error=message)
+        try:
+            request_id = extract_request_id(user_prompt)
+            if request_id:
+                update_request_status(
+                    base,
+                    request_id,
+                    "error",
+                    f"Agent run {run_id} raised {message}",
+                )
+        except Exception:
+            pass  # best-effort; never let error-recording crash the handler
+
+
+def run_agent_process_job(job: dict[str, Any]) -> int:
+    run_id = str(job["run_id"])
+    slug = str(job["slug"])
+    protocol = str(job["protocol"])
+    role = str(job["role"])
+    mode = str(job["mode"])
+    user_prompt = str(job["prompt"])
+    payload = dict(job.get("payload") or {})
+    base = task_root(slug)
+    log_path = Path(str(job["log_path"]))
+    status_path = Path(str(job["status_path"]))
+
+    with RUN_LOCK:
+        RUNS[run_id] = {
+            "run_id": run_id,
+            "slug": slug,
+            "protocol": protocol,
+            "role": role,
+            "mode": mode,
+            "status": "queued",
+            "request_id": extract_request_id(user_prompt),
+            "started_at": utc_now(),
+            "finished_at": "",
+            "log_path": str(log_path.relative_to(base)),
+            "status_path": str(status_path),
+            "progress": "子进程准备执行…",
+            "progress_ts": 0.0,
+            "pid": os.getpid(),
+        }
+    update_run(run_id, status="running", progress="子进程执行中", progress_ts=time.time(), pid=os.getpid())
+    run_agent_worker(run_id, slug, protocol, role, mode, user_prompt, payload, log_path)
+    final_status = RUNS.get(run_id, {}).get("status", "finished")
+    return 0 if final_status in {"finished", "accepted"} else 1
 
 
 def run_openai_compatible(
@@ -1897,7 +2954,7 @@ def run_openai_compatible(
     }
     # 不设置 max_tokens，让模型自由生成
 
-    timeout_seconds = float(payload.get("timeout_seconds", 600))
+    timeout_seconds = float(payload.get("timeout_seconds", 1800))
     url = normalize_chat_url(base_url)
     headers = {
         "Content-Type": "application/json",
@@ -1919,6 +2976,8 @@ def run_openai_compatible(
         ) as response:
             response.raise_for_status()
             for line in response.iter_lines():
+                if is_run_cancelled(str(payload.get("_run_id", ""))):
+                    raise RunCancelled("cancelled by user")
                 if not line:
                     continue
                 # SSE 格式: "data: {...}"
@@ -1983,7 +3042,12 @@ def verify_openai_compatible(payload: dict[str, Any]) -> str:
         normalize_chat_url(base_url),
         json=body,
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-        timeout=httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=10.0),
+        timeout=httpx.Timeout(
+            connect=30.0,
+            read=API_VERIFY_TIMEOUT_SECONDS,
+            write=30.0,
+            pool=30.0,
+        ),
     )
     response.raise_for_status()
     data = response.json()
@@ -2062,6 +3126,9 @@ class MultiAgentWebHandler(SimpleHTTPRequestHandler):
                 except Exception as exc:
                     self.write_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
+            if path == "/api/server/restart":
+                self.write_json(schedule_server_restart())
+                return
             if path.startswith("/api/tasks/") and path.endswith("/interventions"):
                 slug = unquote(path.removeprefix("/api/tasks/").removesuffix("/interventions").strip("/"))
                 payload = self.read_json()
@@ -2076,6 +3143,12 @@ class MultiAgentWebHandler(SimpleHTTPRequestHandler):
                 slug = unquote(path.removeprefix("/api/tasks/").removesuffix("/requests/priority").strip("/"))
                 payload = self.read_json()
                 self.write_json(update_request_priority_web(slug, payload))
+                return
+            if path.startswith("/api/tasks/") and path.endswith("/runs/interrupt"):
+                slug = unquote(path.removeprefix("/api/tasks/").removesuffix("/runs/interrupt").strip("/"))
+                payload = self.read_json()
+                run_id = str(payload.get("run_id") or "").strip() or None
+                self.write_json(cancel_runs(slug, run_id))
                 return
             if path.startswith("/api/tasks/") and path.endswith("/runs"):
                 slug = unquote(path.removeprefix("/api/tasks/").removesuffix("/runs").strip("/"))
@@ -2159,6 +3232,16 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 2
+    def periodic_consolidate() -> None:
+        while True:
+            try:
+                consolidate_all_tasks()
+            except Exception as e:
+                print(f"Error in periodic task consolidation: {e}")
+            time.sleep(30)
+
+    threading.Thread(target=periodic_consolidate, daemon=True).start()
+
     server = ThreadingHTTPServer((args.host, args.port), MultiAgentWebHandler)
     url = f"http://{args.host}:{args.port}/"
     print(f"Multi-agent web dashboard running at {url}")

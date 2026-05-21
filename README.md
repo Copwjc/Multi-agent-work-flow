@@ -7,14 +7,14 @@
 - Code Expert：负责算法实现、测试、实验脚本、性能验证与可复现实验记录。
 - LaTeX Writer：负责将问题、方法、证明、实验与结论组织成可编译的 LaTeX 报告。
 
-五个角色提示词位于 `agents/` 目录，可复制到不同 Codex 会话中使用，也可由 Leader 在同一会话中模拟多轮协作。每个实际任务都会生成独立的 `tasks/<slug>/logs/` 和 `tasks/<slug>/notes/`，用于保存 agent 请求、运行日志、资源登记和阶段总结。
+五个角色提示词位于 `agents/` 目录。当前默认运行模式是：**本地进程编排 + 云端 API 推理**。也就是说，Leader / Literature Collector / Mathematician / Code Expert / LaTeX Writer 的每次执行都由本机上的独立 agent 子进程完成，但模型推理通过配置的 OpenAI 兼容云端 API 完成。agent 之间的直接请求记录在 `logs/inter_agent_dialogue.md`，共享数据、脚本、结果、引用、图表和证明资源记录在 `notes/resource_registry.md`。
 
 ## 目录结构
 
-当前项目仅包含工作流文档、角色提示词、任务模板和脚手架工具；实际任务产物默认不纳入仓库：
+当前项目包含工作流文档、角色提示词、任务模板、脚手架工具和本轮协作日志：
 
 ```text
-multiagent
+~/multiagent
 ├── README.md
 ├── agents
 │   ├── leader.md
@@ -26,16 +26,20 @@ multiagent
 │   ├── inter_agent_dialogue.md
 │   ├── workflow_checklist.md
 │   └── super_admin_override.md
+├── logs
+│   └── agent_interactions.md
+├── notes
+│   └── leader_summary.md
 ├── templates
 │   ├── task_brief.md
 │   ├── agent_interactions.md
 │   ├── inter_agent_dialogue.md
 │   ├── literature_review.md
 │   ├── leader_summary.md
-│   ├── override_directive.md
-│   └── resource_registry.md
+│   └── override_directive.md
 ├── tools
 │   ├── create_task.py
+│   ├── agent_process_worker.py
 │   ├── multiagent_gui.py
 │   ├── multiagent_web.py
 │   └── validate_workflow.py
@@ -53,19 +57,20 @@ python tools/create_task.py "Shortest Path Proof" --slug shortest-path-proof
 tasks
 └── <slug>
     ├── README.md
-    ├── src
-    │   ├── __init__.py
-    │   └── solution.py
-    ├── tests
-    │   └── test_solution.py
     ├── experiments
+    │   ├── src
+    │   │   ├── __init__.py
+    │   │   └── solution.py
+    │   ├── tests
+    │   │   └── test_solution.py
+    │   ├── data
+    │   ├── figures
     │   ├── run_experiment.py
     │   ├── analysis.md
     │   └── outputs
     ├── report
     │   ├── main.tex
-    │   ├── references.bib
-    │   └── figures
+    │   └── references.bib
     ├── notes
     │   ├── task_brief.md
     │   ├── literature_review.md
@@ -125,11 +130,23 @@ python3 -m venv .venv
 http://127.0.0.1:8765/
 ```
 
-界面会读取 `tasks/<slug>/logs/inter_agent_dialogue.md`、`tasks/<slug>/logs/agent_interactions.md` 和 `tasks/<slug>/notes/resource_registry.md`。用户输入框支持普通指令、资源请求、证据请求、理论检查、实现检查和 Super Admin Override；提交后会写回对应任务日志。
+Windows 下也可以直接双击根目录脚本：
+
+```bat
+start_multiagent.bat
+```
+
+macOS 下也可以直接双击根目录脚本：
+
+```bash
+start_multiagent.command
+```
+
+界面会读取 `tasks/<slug>/logs/inter_agent_dialogue.md`、`logs/agent_interactions.md` 和 `notes/resource_registry.md`。用户输入框支持普通指令、资源请求、证据请求、理论检查、实现检查和 Super Admin Override；提交后会写回对应任务日志。
 
 ### Agent Runner / 外部模型接口
 
-网页端提供 `Agent 调度` 面板，支持调用国内主流大模型 API 生成 coding plan 或执行任务。
+网页端提供 `Agent 调度` 面板，支持调用国内主流大模型 API 生成 coding plan 或执行任务。每个 agent run 会由本地后端拉起一个独立子进程，本地子进程负责读取任务上下文、写入产物、运行受控本地命令，并通过云端 API 获取模型输出。
 
 支持的开箱即用提供商：
 
@@ -146,19 +163,26 @@ http://127.0.0.1:8765/
 
 安全约定：
 
-- Base URL、模型名称和协议会保存在本地浏览器，便于重复使用。
-- API key 默认只临时使用；勾选“记住 API Key”后仅保存到本地浏览器 localStorage，不写入项目文件或仓库。
-- `plan_only` 只生成计划并写入 `tasks/<slug>/notes/runner_<run_id>.md`。
+- API key 不在网页和项目文件中保存，只读取环境变量。
+- `plan_only` 只生成计划并写入 `notes/runner_<run_id>.md`。
 - `execute` 允许 runner 在任务目录内修改产物，并可通过显式 `command` 代码块运行受控本地命令。命令执行采用白名单，不支持任意 shell、重定向、包安装、网络下载或破坏性命令。
+- 每次 agent 调度都会生成本地 `agent_process_worker.py` 子进程，因此执行隔离在进程级，而不是把所有 agent 逻辑塞进同一个服务线程里。
 - 运行日志写入 `tasks/<slug>/logs/agent_runs/<run_id>.log`，并同步记录到
-  `tasks/<slug>/logs/agent_interactions.md`。
+  `logs/agent_interactions.md`。
 
 本地执行命令格式：
 
 ````text
 ```command cwd="."
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s experiments/tests -v
 python3 experiments/run_experiment.py
+```
+
+或在 `experiments/` 下运行：
+
+```command cwd="experiments"
+python3 -m unittest discover -s tests -v
+python3 run_experiment.py
 ```
 ````
 
@@ -354,7 +378,7 @@ python tools/multiagent_gui.py
 python tools/multiagent_gui.py --check
 ```
 
-GUI 当前负责记录和查看工作流状态，不会自动启动真实子 agent。真正执行 multi-agent 工作仍由 Codex Leader 在会话中调度；GUI 写入的 `tasks/<slug>/logs/agent_interactions.md`、`tasks/<slug>/logs/inter_agent_dialogue.md`、`tasks/<slug>/logs/override_log.md` 和 `tasks/<slug>/notes/task_brief.md` 可作为调度上下文。
+GUI 当前负责记录和查看工作流状态，不会自动启动真实子 agent。真正执行 multi-agent 工作仍由 Codex Leader 在会话中调度；GUI 写入的 `logs/agent_interactions.md`、`logs/inter_agent_dialogue.md`、`logs/override_log.md` 和 `notes/task_brief.md` 可作为调度上下文。
 
 在 GUI 的 `Agent Handoff / Dialogue Entry` 区域，可以记录更细的 agent 交互：
 

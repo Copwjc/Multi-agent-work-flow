@@ -6,7 +6,7 @@
 
 Use this file as a compact internal handoff log. Keep entries short, factual, and tied to artifacts.
 For detailed agent-to-agent requests, evidence chains, replies, and blockers,
-use `inter_agent_dialogue.md`.
+use backend workflow state.
 
 ## Interaction Timeline
 
@@ -46,7 +46,7 @@ use `inter_agent_dialogue.md`.
 
 ## Evidence Chain Summary
 
-- TODO: summarize important request chains from `inter_agent_dialogue.md`, such as
+- TODO: summarize important request chains from backend workflow state, such as
   `leader -> literature_collector -> latex_writer` or
   `latex_writer -> code_expert -> mathematician -> code_expert -> latex_writer`.
 
